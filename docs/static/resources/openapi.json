@@ -3257,12 +3257,6 @@
             "description": "Override CSS for the dashboard.",
             "type": "string"
           },
-          "custom_tags": {
-            "items": {
-              "$ref": "#/components/schemas/Tag1"
-            },
-            "type": "array"
-          },
           "dashboard_title": {
             "description": "A title for the dashboard.",
             "type": "string"
@@ -17207,7 +17201,6 @@
                     "charts": [],
                     "created_on_delta_humanized": "string",
                     "css": "string",
-                    "custom_tags": [],
                     "dashboard_title": "string",
                     "id": 1,
                     "is_managed_externally": true,
