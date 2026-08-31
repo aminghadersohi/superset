@@ -32,6 +32,10 @@ from superset.mcp_service.chart.compile import (
     CompileResult,
     validate_and_compile,
 )
+from superset.mcp_service.chart.plugins.bubble import (
+    bubble_metric_output_status,
+    bubble_metrics_requiring_query_validation,
+)
 from superset.mcp_service.chart.schemas import (
     BigNumberChartConfig,
     BubbleChartConfig,
@@ -355,6 +359,102 @@ class TestValidateAndCompileChartTypeCoverage:
         assert "could not be verified" in result.error_obj.message
 
     @pytest.mark.parametrize(
+        "expression",
+        [
+            "SUM(CAST(name AS VARCHAR /* INT */))",
+            "AVG(CAST(name AS TEXT -- DOUBLE\n))",
+            "MEDIAN(CAST(name AS VARCHAR /* DECIMAL */))",
+            "STDDEV(CAST(name AS VARCHAR /* DECIMAL */))",
+            "STDDEV_SAMP(CAST(name AS VARCHAR /* DECIMAL */))",
+            "VAR(CAST(name AS VARCHAR /* DECIMAL */))",
+            "VAR_SAMP(CAST(name AS VARCHAR /* DECIMAL */))",
+            "PERCENTILE(CAST(name AS VARCHAR /* DECIMAL */), 0.5)",
+            "SUM(((CAST(name AS VARCHAR /* misleading ) INT ( */))))",
+        ],
+    )
+    def test_bubble_numeric_aggregate_requires_proven_nested_argument(
+        self, expression: str
+    ) -> None:
+        """Aggregate wrappers must not hide ambiguous nested CAST targets."""
+        ds = _orm_dataset(metric_names=["nested_cast"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        context = build_dataset_context_from_orm(ds)
+        assert context is not None
+        metric = ColumnRef(name="nested_cast", saved_metric=True)
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=metric,
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+
+        assert bubble_metric_output_status(metric, context) == "unknown"
+        assert bubble_metrics_requiring_query_validation(config, context) == ["x"]
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "SUM(CAST(name AS VARCHAR /* INT */))",
+            "AVG(CAST(name AS TEXT -- DOUBLE\n))",
+        ],
+    )
+    @patch("superset.mcp_service.chart.compile._compile_chart")
+    def test_bubble_nested_commented_cast_forces_query_on_no_compile_path(
+        self, mock_compile: Mock, expression: str
+    ) -> None:
+        """A requested no-query path must execute when nested proof is unknown."""
+        ds = _orm_dataset(metric_names=["nested_cast"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="nested_cast", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_compile.return_value = CompileResult(success=True)
+
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+
+        assert result.success
+        mock_compile.assert_called_once_with(
+            {}, ds.id, bubble_runtime_validation_required=True
+        )
+
+    @pytest.mark.parametrize(
+        ("expression", "expected_status"),
+        [
+            ("SUM(num)", "numeric"),
+            ("AVG((num))", "numeric"),
+            ("SUM(CAST(num AS DECIMAL(10, 2)))", "numeric"),
+            ("AVG(TRY_CAST(num AS DOUBLE PRECISION))", "numeric"),
+            (
+                "SUM(CAST(COALESCE(num, '/* VARCHAR ) */ -- TEXT (') "
+                "AS DECIMAL(10, 2)))",
+                "numeric",
+            ),
+            ("CAST(MAX(name) AS VARCHAR)", "nonnumeric"),
+            ("SUM(CAST(name AS VARCHAR))", "nonnumeric"),
+        ],
+    )
+    def test_bubble_nested_aggregate_static_proofs(
+        self, expression: str, expected_status: str
+    ) -> None:
+        """Clean numeric proofs survive nesting and quoted comment-like text."""
+        ds = _orm_dataset(metric_names=["static_proof"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        context = build_dataset_context_from_orm(ds)
+        assert context is not None
+        metric = ColumnRef(name="static_proof", saved_metric=True)
+
+        assert bubble_metric_output_status(metric, context) == expected_status
+
+    @pytest.mark.parametrize(
         ("metric_kind", "expression"),
         [
             ("saved", "COUNT(*) || COALESCE(MAX(name), '')"),
@@ -426,9 +526,29 @@ class TestValidateAndCompileChartTypeCoverage:
                 "CAST(COALESCE(MAX(name), '/* INT */ -- DECIMAL') AS TEXT)",
                 "INVALID_BUBBLE_METRIC_OUTPUT",
             ),
+            (
+                "SUM(CAST(name AS VARCHAR /* INT */))",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            (
+                "AVG(CAST(name AS TEXT -- DOUBLE\n))",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            (
+                "SUM(((CAST(name AS VARCHAR /* misleading ) INT ( */))))",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            ("SUM(CAST(name AS VARCHAR))", "INVALID_BUBBLE_METRIC_OUTPUT"),
             ("CAST(MAX(num) AS INT)", None),
             ("TRY_CAST(MAX(num) AS DOUBLE PRECISION)", None),
             ("CAST((COALESCE(MAX(num), 0)) AS DECIMAL(10, 2))", None),
+            ("SUM(num)", None),
+            ("AVG(CAST(num AS DECIMAL(10, 2)))", None),
+            (
+                "SUM(CAST(COALESCE(num, '/* VARCHAR ) */ -- TEXT (') "
+                "AS DECIMAL(10, 2)))",
+                None,
+            ),
         ],
     )
     @patch("superset.commands.chart.data.get_data_command.ChartDataCommand")

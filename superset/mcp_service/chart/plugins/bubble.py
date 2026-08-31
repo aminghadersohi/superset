@@ -92,16 +92,31 @@ def _unquote_identifier(value: str) -> str:
 def _matching_closing_parenthesis(  # noqa: C901
     sql: str, opening: int
 ) -> int | None:
-    """Return the parenthesis matching ``opening``, ignoring quoted content."""
+    """Return the parenthesis matching ``opening``, ignoring quoted SQL/comments.
+
+    Quotes and comments are scanned in place rather than removed so their
+    contents cannot change the apparent parenthesis structure.
+    """
     depth = 0
     quote: str | None = None
+    comment: Literal["line", "block"] | None = None
     index = opening
     while index < len(sql):
         char = sql[index]
-        if quote is not None:
+        if comment == "line":
+            if char in {"\r", "\n"}:
+                comment = None
+        elif comment == "block":
+            if sql.startswith("*/", index):
+                comment = None
+                index += 1
+        elif quote is not None:
             if quote == "]":
                 if char == "]":
-                    quote = None
+                    if index + 1 < len(sql) and sql[index + 1] == "]":
+                        index += 1
+                    else:
+                        quote = None
             elif char == "\\":
                 # Some engines support backslash escapes in quoted values.
                 index += 1
@@ -114,6 +129,12 @@ def _matching_closing_parenthesis(  # noqa: C901
             quote = char
         elif char == "[":
             quote = "]"
+        elif sql.startswith("--", index):
+            comment = "line"
+            index += 1
+        elif sql.startswith("/*", index):
+            comment = "block"
+            index += 1
         elif char == "(":
             depth += 1
         elif char == ")":
@@ -158,7 +179,10 @@ def _parse_cast_type(argument: str) -> str | None:  # noqa: C901
         if quote is not None:
             if quote == "]":
                 if char == "]":
-                    quote = None
+                    if index + 1 < len(argument) and argument[index + 1] == "]":
+                        index += 1
+                    else:
+                        quote = None
             elif char == "\\":
                 index += 1
             elif char == quote:
@@ -215,6 +239,8 @@ def _sql_expression_output_status(  # noqa: C901
         return "unknown"
     sql = _strip_balanced_outer_parentheses(expression.strip())
 
+    if _SIMPLE_IDENTIFIER.fullmatch(sql):
+        return _column_output_status(_unquote_identifier(sql), dataset_context)
     if _NUMERIC_LITERAL.fullmatch(sql):
         return "numeric"
     if sql.startswith("'") and sql.endswith("'"):
@@ -237,16 +263,12 @@ def _sql_expression_output_status(  # noqa: C901
     if function in _COUNT_AGGREGATES:
         return "numeric"
     if function in _NUMERIC_AGGREGATES:
-        # These functions have numeric output when the database accepts their
-        # input. Catch obvious text-column/literal mistakes before compilation.
-        if _SIMPLE_IDENTIFIER.fullmatch(argument):
-            return _column_output_status(_unquote_identifier(argument), dataset_context)
-        if argument.startswith("'") and argument.endswith("'"):
-            return "nonnumeric"
-        return "numeric"
+        # Numeric aggregates prove their output type only when their complete
+        # argument is itself proven numeric. This deliberately recurses through
+        # balanced wrappers and CAST parsing instead of assuming every complex
+        # argument is numeric; ambiguous expressions require runtime proof.
+        return _sql_expression_output_status(argument, dataset_context)
     if function in {"MIN", "MAX"}:
-        if _SIMPLE_IDENTIFIER.fullmatch(argument):
-            return _column_output_status(_unquote_identifier(argument), dataset_context)
         return _sql_expression_output_status(argument, dataset_context)
     return "unknown"
 
