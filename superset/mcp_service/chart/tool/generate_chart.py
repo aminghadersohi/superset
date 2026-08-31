@@ -409,7 +409,7 @@ async def generate_chart(  # noqa: C901
             # Compile before persisting. A failed query must not leave a broken
             # chart row behind and then rely on a later transaction to delete it.
             with event_logger.log_context(action="mcp.generate_chart.compile_check"):
-                compile_result = _compile_chart(form_data, dataset.id)
+                compile_result = validate_and_compile(config, form_data, dataset)
             if not compile_result.success:
                 logger.warning(
                     "Compile check failed before chart creation: %s",
@@ -598,7 +598,7 @@ async def generate_chart(  # noqa: C901
             # Compile check for preview-only mode
             # Validate dataset existence and user access before running queries
             await ctx.report_progress(3, 5, "Running compile check (test query)")
-            numeric_dataset_id: int | None = None
+            dataset = None
             from superset.daos.dataset import DatasetDAO
 
             if isinstance(request.dataset_id, int) or (
@@ -609,19 +609,21 @@ async def generate_chart(  # noqa: C901
                     if isinstance(request.dataset_id, str)
                     else request.dataset_id
                 )
-                ds = DatasetDAO.find_by_id(candidate_id)
-                if ds and has_dataset_access(ds):
-                    numeric_dataset_id = ds.id
+                candidate_dataset = DatasetDAO.find_by_id(candidate_id)
+                if candidate_dataset and has_dataset_access(candidate_dataset):
+                    dataset = candidate_dataset
             else:
-                ds = DatasetDAO.find_by_id(request.dataset_id, id_column="uuid")
-                if ds and has_dataset_access(ds):
-                    numeric_dataset_id = ds.id
+                candidate_dataset = DatasetDAO.find_by_id(
+                    request.dataset_id, id_column="uuid"
+                )
+                if candidate_dataset and has_dataset_access(candidate_dataset):
+                    dataset = candidate_dataset
 
-            if numeric_dataset_id is not None:
+            if dataset is not None:
                 with event_logger.log_context(
                     action="mcp.generate_chart.compile_check"
                 ):
-                    compile_result = _compile_chart(form_data, numeric_dataset_id)
+                    compile_result = validate_and_compile(config, form_data, dataset)
                 if not compile_result.success:
                     await ctx.warning(
                         "Chart compile check failed: error=%s" % (compile_result.error,)

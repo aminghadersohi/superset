@@ -52,7 +52,7 @@ _NUMERIC_AGGREGATES = {
     "VAR_SAMP",
 }
 _SIMPLE_IDENTIFIER = re.compile(r'^(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])$')
-_FUNCTION_CALL = re.compile(r"^([A-Za-z_][\w$]*)\s*\((.*)\)$", re.DOTALL)
+_FUNCTION_PREFIX = re.compile(r"^([A-Za-z_][\w$]*)\s*\(")
 _NUMERIC_LITERAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
 _NONNUMERIC_SQL_TYPE = re.compile(
     r"\b(?:CHAR|VARCHAR|STRING|TEXT|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP)\b",
@@ -84,6 +84,64 @@ def _unquote_identifier(value: str) -> str:
     return value
 
 
+def _matching_closing_parenthesis(  # noqa: C901
+    sql: str, opening: int
+) -> int | None:
+    """Return the parenthesis matching ``opening``, ignoring quoted content."""
+    depth = 0
+    quote: str | None = None
+    index = opening
+    while index < len(sql):
+        char = sql[index]
+        if quote is not None:
+            if quote == "]":
+                if char == "]":
+                    quote = None
+            elif char == "\\":
+                # Some engines support backslash escapes in quoted values.
+                index += 1
+            elif char == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    index += 1
+                else:
+                    quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+        elif char == "[":
+            quote = "]"
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+            if depth < 0:
+                return None
+        index += 1
+    return None
+
+
+def _strip_balanced_outer_parentheses(sql: str) -> str:
+    """Remove only parentheses that enclose the complete expression."""
+    while sql.startswith("("):
+        closing = _matching_closing_parenthesis(sql, 0)
+        if closing != len(sql) - 1:
+            break
+        sql = sql[1:-1].strip()
+    return sql
+
+
+def _parse_outer_function_call(sql: str) -> tuple[str, str] | None:
+    """Parse a single balanced outermost function call, without trailing SQL."""
+    match = _FUNCTION_PREFIX.match(sql)
+    if match is None:
+        return None
+    opening = match.end() - 1
+    if _matching_closing_parenthesis(sql, opening) != len(sql) - 1:
+        return None
+    return match.group(1).upper(), sql[opening + 1 : -1].strip()
+
+
 def _sql_expression_output_status(  # noqa: C901
     expression: str | None, dataset_context: Any
 ) -> BubbleMetricOutputStatus:
@@ -95,30 +153,30 @@ def _sql_expression_output_status(  # noqa: C901
     """
     if not expression or not expression.strip():
         return "unknown"
-    sql = expression.strip()
-    while sql.startswith("(") and sql.endswith(")"):
-        sql = sql[1:-1].strip()
+    sql = _strip_balanced_outer_parentheses(expression.strip())
 
     if _NUMERIC_LITERAL.fullmatch(sql):
         return "numeric"
     if sql.startswith("'") and sql.endswith("'"):
         return "nonnumeric"
 
-    cast_match = re.fullmatch(
-        r"(?:TRY_)?CAST\s*\(.+\s+AS\s+([^\)]+)\)", sql, re.IGNORECASE | re.DOTALL
-    )
-    if cast_match:
+    function_call = _parse_outer_function_call(sql)
+    if function_call is None:
+        return "unknown"
+    function, argument = function_call
+
+    if function in {"CAST", "TRY_CAST"}:
+        cast_match = re.fullmatch(
+            r".+\s+AS\s+(.+)", argument, re.IGNORECASE | re.DOTALL
+        )
+        if cast_match is None:
+            return "unknown"
         cast_type = cast_match.group(1).strip()
         if is_numeric_column({"type": cast_type}):
             return "numeric"
         if _NONNUMERIC_SQL_TYPE.search(cast_type):
             return "nonnumeric"
-
-    function_match = _FUNCTION_CALL.fullmatch(sql)
-    if not function_match:
         return "unknown"
-    function = function_match.group(1).upper()
-    argument = function_match.group(2).strip()
     if function in _COUNT_AGGREGATES:
         return "numeric"
     if function in _NUMERIC_AGGREGATES:

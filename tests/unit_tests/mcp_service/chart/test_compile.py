@@ -354,6 +354,56 @@ class TestValidateAndCompileChartTypeCoverage:
         assert result.error_obj.error_code == "INVALID_BUBBLE_QUERY_DATA"
         assert "could not be verified" in result.error_obj.message
 
+    @pytest.mark.parametrize(
+        ("metric_kind", "expression"),
+        [
+            ("saved", "COUNT(*) || COALESCE(MAX(name), '')"),
+            ("saved", "COUNT(*) > COALESCE(MAX(num), 0)"),
+            ("adhoc", "SUM(num) || MAX(name)"),
+            ("adhoc", "SUM(num) > COALESCE(MAX(num), 0)"),
+        ],
+    )
+    @patch("superset.commands.chart.data.get_data_command.ChartDataCommand")
+    @patch("superset.common.query_context_factory.QueryContextFactory")
+    def test_empty_bubble_compound_sql_requires_runtime_numeric_proof(
+        self,
+        mock_factory: Mock,
+        mock_command: Mock,
+        metric_kind: str,
+        expression: str,
+    ) -> None:
+        """String/boolean compounds must not inherit a numeric function's type."""
+        ds = _orm_dataset(
+            metric_names=["compound_metric"] if metric_kind == "saved" else None
+        )
+        if metric_kind == "saved":
+            ds.metrics[0].expression = expression
+            ds.metrics[0].metric_type = None
+            ds.metrics[0].d3format = None
+            metric = ColumnRef(name="compound_metric", saved_metric=True)
+        else:
+            metric = ColumnRef(sql_expression=expression, label="Compound metric")
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=metric,
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_factory.return_value.create.return_value = Mock()
+        mock_command.return_value.run.return_value = {"queries": [{"data": []}]}
+
+        result = validate_and_compile(
+            config,
+            map_bubble_config(config),
+            ds,
+            run_compile_check=False,
+        )
+
+        assert not result.success
+        assert result.error_obj is not None
+        assert result.error_obj.error_code == "INVALID_BUBBLE_QUERY_DATA"
+        assert "could not be verified" in result.error_obj.message
+
     def test_pivot_table_bad_row_rejected(self):
         ds = _orm_dataset()
         config = PivotTableChartConfig(
