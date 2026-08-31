@@ -150,14 +150,16 @@ class TestValidateAndCompileChartTypeCoverage:
         result = validate_and_compile(config, {}, ds, run_compile_check=False)
         assert result.success, result.error
 
-    def test_bubble_sum_on_non_numeric_column_rejected(self):
+    @pytest.mark.parametrize("field", ["x", "y", "size"])
+    def test_bubble_sum_on_non_numeric_column_rejected(self, field):
         ds = _orm_dataset()
-        config = BubbleChartConfig(
-            entity=ColumnRef(name="name"),
-            x=ColumnRef(name="num", aggregate="AVG"),
-            y=ColumnRef(name="gender", aggregate="SUM"),
-            size=ColumnRef(name="num", aggregate="SUM"),
-        )
+        metrics = {
+            "x": ColumnRef(name="num", aggregate="AVG"),
+            "y": ColumnRef(name="num", aggregate="MAX"),
+            "size": ColumnRef(name="num", aggregate="SUM"),
+        }
+        metrics[field] = ColumnRef(name="gender", aggregate="SUM")
+        config = BubbleChartConfig(entity=ColumnRef(name="name"), **metrics)
 
         result = validate_and_compile(config, {}, ds, run_compile_check=False)
 

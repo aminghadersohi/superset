@@ -23,6 +23,7 @@ separate metric keys ``x``/``y``/``size`` and an optional ``series``), and
 registry integration.
 """
 
+from copy import deepcopy
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -32,15 +33,21 @@ from superset.mcp_service.chart.chart_utils import (
     analyze_chart_capabilities,
     analyze_chart_semantics,
     map_bubble_config,
+    map_config_to_form_data,
 )
 from superset.mcp_service.chart.compile import _compile_chart
-from superset.mcp_service.chart.preview_utils import _build_query_fields
+from superset.mcp_service.chart.preview_utils import (
+    _build_query_fields,
+    _generate_vega_lite_preview_from_data,
+)
 from superset.mcp_service.chart.schemas import (
     BubbleChartConfig,
     ChartConfig,
     GenerateChartRequest,
+    GetChartPreviewRequest,
     UpdateChartRequest,
 )
+from superset.mcp_service.chart.tool.get_chart_preview import VegaLitePreviewStrategy
 from superset.utils import json
 
 
@@ -103,6 +110,11 @@ class TestBubbleChartConfigSchema:
         )
         assert config.x.saved_metric is True
 
+    @pytest.mark.parametrize("field", ["x", "y", "size"])
+    def test_bubble_metrics_reject_plain_dimension_refs(self, field: str) -> None:
+        with pytest.raises(ValidationError, match=rf"{field} must define an aggregate"):
+            BubbleChartConfig(**_base(**{field: {"name": "gdp"}}))
+
     def test_chart_config_union_dispatches_bubble(self) -> None:
         config = TypeAdapter(ChartConfig).validate_python(_base())
         assert isinstance(config, BubbleChartConfig)
@@ -158,6 +170,93 @@ class TestBubbleChartConfigSchema:
         assert request.config.x.saved_metric is True
         assert request.config.y.sql_expression is not None
         assert request.config.size.label == "Population"
+
+    @pytest.mark.parametrize(
+        ("request_type", "request_fields"),
+        [
+            (GenerateChartRequest, {"dataset_id": 7}),
+            (UpdateChartRequest, {"identifier": 9}),
+        ],
+    )
+    @patch(
+        "superset.mcp_service.chart.chart_utils._is_temporal_for_dashboard_binding",
+        return_value=True,
+    )
+    @patch("superset.mcp_service.chart.chart_utils._find_dataset_by_id_or_uuid")
+    def test_temporal_native_form_data_round_trips_through_requests(
+        self,
+        mock_find_dataset: MagicMock,
+        mock_is_temporal: MagicMock,
+        request_type,
+        request_fields: dict[str, int],
+    ) -> None:
+        mock_find_dataset.return_value = Mock(main_dttm_col="ds")
+        native_form_data = map_config_to_form_data(
+            BubbleChartConfig(
+                **_base(filters=[{"column": "year", "op": "=", "value": 2026}])
+            ),
+            dataset_id=7,
+        )
+        mock_is_temporal.assert_called()
+
+        assert native_form_data["_mcp_dashboard_time_filter_subject"] == "ds"
+        request = request_type.model_validate(
+            {**request_fields, "config": deepcopy(native_form_data)}
+        )
+        config = request.config
+
+        assert isinstance(config, BubbleChartConfig)
+        assert config.temporal_column == "ds"
+        assert config.filters is not None
+        assert [(filter_.column, filter_.op) for filter_ in config.filters] == [
+            ("year", "=")
+        ]
+
+        remapped = map_config_to_form_data(config, dataset_id=7)
+        assert remapped["_mcp_dashboard_time_filter_subject"] == "ds"
+        assert [
+            (filter_["subject"], filter_["operator"])
+            for filter_ in remapped["adhoc_filters"]
+        ] == [("year", "=="), ("ds", "TEMPORAL_RANGE")]
+
+    @pytest.mark.parametrize(
+        ("request_type", "request_fields"),
+        [
+            (GenerateChartRequest, {"dataset_id": 7}),
+            (UpdateChartRequest, {"identifier": 9}),
+        ],
+    )
+    @patch(
+        "superset.mcp_service.chart.chart_utils._is_temporal_for_dashboard_binding",
+        return_value=True,
+    )
+    @patch("superset.mcp_service.chart.chart_utils._find_dataset_by_id_or_uuid")
+    def test_temporal_round_trip_rejects_unrelated_native_filter(
+        self,
+        mock_find_dataset: MagicMock,
+        mock_is_temporal: MagicMock,
+        request_type,
+        request_fields: dict[str, int],
+    ) -> None:
+        mock_find_dataset.return_value = Mock(main_dttm_col="ds")
+        native_form_data = map_config_to_form_data(
+            BubbleChartConfig(**_base()), dataset_id=7
+        )
+        mock_is_temporal.assert_called()
+        native_form_data["adhoc_filters"].append(
+            {
+                "clause": "WHERE",
+                "expressionType": "SIMPLE",
+                "subject": "other_ds",
+                "operator": "TEMPORAL_RANGE",
+                "comparator": "No filter",
+            }
+        )
+
+        with pytest.raises(ValidationError, match="TEMPORAL_RANGE"):
+            request_type.model_validate(
+                {**request_fields, "config": deepcopy(native_form_data)}
+            )
 
 
 class TestMapBubbleConfig:
@@ -238,6 +337,76 @@ class TestBubbleMetricsResolution:
             "AVG(life_expectancy)",
             "SUM(population)",
         ]
+
+
+class TestBubbleVegaLitePreview:
+    """Bubble previews must preserve all visual encodings."""
+
+    def test_bubble_preview_uses_position_size_entity_and_series(self) -> None:
+        form_data = map_bubble_config(
+            BubbleChartConfig(**_base(series={"name": "continent"}))
+        )
+        data = [
+            {
+                "country": "France",
+                "continent": "Europe",
+                "AVG(gdp)": 44000,
+                "AVG(life_expectancy)": 82.3,
+                "SUM(population)": 68_000_000,
+            }
+        ]
+
+        preview = _generate_vega_lite_preview_from_data(data, form_data)
+        spec = preview.specification
+
+        assert spec["mark"]["type"] == "point"
+        assert spec["encoding"]["x"] == {
+            "field": "AVG(gdp)",
+            "type": "quantitative",
+            "title": "AVG(gdp)",
+        }
+        assert spec["encoding"]["y"]["field"] == "AVG(life_expectancy)"
+        assert spec["encoding"]["size"]["field"] == "SUM(population)"
+        assert spec["encoding"]["detail"] == {
+            "field": "country",
+            "type": "nominal",
+        }
+        assert spec["encoding"]["color"]["field"] == "continent"
+        assert [item["field"] for item in spec["encoding"]["tooltip"]] == [
+            "country",
+            "continent",
+            "AVG(gdp)",
+            "AVG(life_expectancy)",
+            "SUM(population)",
+        ]
+
+    def test_saved_bubble_preview_uses_native_metric_fields(self) -> None:
+        form_data = map_bubble_config(BubbleChartConfig(**_base()))
+        chart = Mock(
+            viz_type="bubble_v2",
+            params=json.dumps(form_data),
+            slice_name="Economic outlook",
+        )
+        strategy = VegaLitePreviewStrategy(
+            chart,
+            GetChartPreviewRequest(identifier=9, format="vega_lite"),
+        )
+
+        spec = strategy._create_vega_lite_spec(
+            [
+                {
+                    "country": "France",
+                    "AVG(gdp)": 44000,
+                    "AVG(life_expectancy)": 82.3,
+                    "SUM(population)": 68_000_000,
+                }
+            ]
+        )
+
+        assert spec["mark"]["type"] == "point"
+        assert spec["encoding"]["x"]["field"] == "AVG(gdp)"
+        assert spec["encoding"]["y"]["field"] == "AVG(life_expectancy)"
+        assert spec["encoding"]["size"]["field"] == "SUM(population)"
 
 
 class TestBubblePluginRegistry:

@@ -38,6 +38,76 @@ logger = logging.getLogger(__name__)
 SUPPORTED_FORM_DATA_PREVIEW_FORMATS = frozenset({"ascii", "table", "vega_lite"})
 
 
+def _bubble_metric_field(metric: Any) -> str | None:
+    """Return the query-result field name for a native Bubble metric."""
+    if isinstance(metric, str):
+        return metric
+    if not isinstance(metric, dict):
+        return None
+    label = metric.get("label")
+    return label if isinstance(label, str) and label else None
+
+
+def _build_bubble_vega_lite_spec(
+    data: List[Any], form_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build a Bubble-specific point specification from native form data."""
+    entity = form_data.get("entity")
+    series = form_data.get("series")
+    x_field = _bubble_metric_field(form_data.get("x"))
+    y_field = _bubble_metric_field(form_data.get("y"))
+    size_field = _bubble_metric_field(form_data.get("size"))
+
+    encoding: Dict[str, Any] = {}
+    if x_field:
+        encoding["x"] = {
+            "field": x_field,
+            "type": "quantitative",
+            "title": x_field,
+        }
+    if y_field:
+        encoding["y"] = {
+            "field": y_field,
+            "type": "quantitative",
+            "title": y_field,
+        }
+    if size_field:
+        encoding["size"] = {
+            "field": size_field,
+            "type": "quantitative",
+            "title": size_field,
+        }
+    if isinstance(entity, str) and entity:
+        encoding["detail"] = {"field": entity, "type": "nominal"}
+    if isinstance(series, str) and series:
+        encoding["color"] = {
+            "field": series,
+            "type": "nominal",
+            "title": series,
+        }
+
+    quantitative_fields = {x_field, y_field, size_field}
+    tooltip_fields = [
+        field
+        for field in (entity, series, x_field, y_field, size_field)
+        if isinstance(field, str) and field
+    ]
+    encoding["tooltip"] = [
+        {
+            "field": field,
+            "type": "quantitative" if field in quantitative_fields else "nominal",
+        }
+        for field in dict.fromkeys(tooltip_fields)
+    ]
+
+    return {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "data": {"values": data},
+        "mark": {"type": "point", "filled": True, "tooltip": True},
+        "encoding": encoding,
+    }
+
+
 def _build_query_columns(form_data: Dict[str, Any]) -> list[Any]:
     """Build query columns list from form_data, including both x_axis and groupby.
 
@@ -486,6 +556,16 @@ def _generate_vega_lite_preview_from_data(  # noqa: C901
     """Generate Vega-Lite preview from raw data and form_data."""
     viz_type = form_data.get("viz_type", "table")
 
+    if viz_type == "bubble_v2":
+        spec = _build_bubble_vega_lite_spec(data, form_data)
+        spec["width"] = "container"
+        spec["height"] = 400
+        return VegaLitePreview(
+            specification=spec,
+            data_url=None,
+            supports_streaming=False,
+        )
+
     # Map Superset viz types to Vega-Lite marks
     viz_to_mark = {
         "echarts_timeseries_line": "line",
@@ -590,7 +670,7 @@ def _generate_vega_lite_preview_from_data(  # noqa: C901
 
     # Add responsive sizing - Vega-Lite supports "container" as a special width value
     spec["width"] = "container"
-    spec["height"] = 400  # type: ignore
+    spec["height"] = 400
 
     # Add interactivity
     if mark in ["line", "point", "bar", "area"]:

@@ -39,6 +39,7 @@ from superset.mcp_service.chart.chart_helpers import (
     find_chart_by_identifier,
 )
 from superset.mcp_service.chart.chart_utils import validate_chart_dataset
+from superset.mcp_service.chart.preview_utils import _build_bubble_vega_lite_spec
 from superset.mcp_service.chart.schemas import (
     AccessibilityMetadata,
     ASCIIPreview,
@@ -466,6 +467,22 @@ class VegaLitePreviewStrategy(PreviewFormatStrategy):
 
         # Determine chart type based on Superset viz_type
         viz_type = getattr(self.chart, "viz_type", "table") or "table"
+
+        if viz_type == "bubble_v2":
+            bubble_spec = _build_bubble_vega_lite_spec(
+                data, self._get_form_data() or {}
+            )
+            bubble_spec.update(
+                {
+                    "description": (
+                        "Chart preview for "
+                        f"{getattr(self.chart, 'slice_name', 'Untitled Chart')}"
+                    ),
+                    "width": self.request.width or 400,
+                    "height": self.request.height or 300,
+                }
+            )
+            return bubble_spec
 
         # Basic Vega-Lite specification
         spec = {

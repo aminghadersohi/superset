@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     from superset.connectors.sqla.models import SqlaTable
 
 from superset.constants import NO_TIME_RANGE
+from superset.mcp_service.chart.chart_helpers import (
+    MCP_DASHBOARD_TIME_FILTER_SUBJECT,
+)
 from superset.mcp_service.chart.schemas import (
     BigNumberChartConfig,
     BoxPlotChartConfig,
@@ -62,8 +65,6 @@ from superset.utils import json
 from superset.utils.core import FilterOperator
 
 logger = logging.getLogger(__name__)
-
-MCP_DASHBOARD_TIME_FILTER_SUBJECT = "_mcp_dashboard_time_filter_subject"
 
 
 @dataclass

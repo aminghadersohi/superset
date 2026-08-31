@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MCP_DASHBOARD_TIME_FILTER_SUBJECT = "_mcp_dashboard_time_filter_subject"
+
 # extra_form_data override targets that the query object actually reads. Note
 # that ``time_grain`` is deliberately absent: the query object has no such field
 # and nothing downstream consumes it, matching the REST path, where

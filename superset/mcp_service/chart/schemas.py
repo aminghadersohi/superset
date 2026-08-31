@@ -41,8 +41,11 @@ from pydantic import (
 )
 from typing_extensions import Self
 
-from superset.constants import TimeGrain
+from superset.constants import NO_TIME_RANGE, TimeGrain
 from superset.daos.base import ColumnOperator, ColumnOperatorEnum
+from superset.mcp_service.chart.chart_helpers import (
+    MCP_DASHBOARD_TIME_FILTER_SUBJECT,
+)
 from superset.mcp_service.common.cache_schemas import (
     CacheStatus,
     CreatedByMeMixin,
@@ -1090,6 +1093,18 @@ def _coerce_native_bubble_filter(filter_: Any) -> dict[str, Any]:
     }
 
 
+def _is_generated_bubble_temporal_filter(filter_: Any, subject: str) -> bool:
+    """Return whether a native filter is the generated neutral time binding."""
+    return (
+        isinstance(filter_, dict)
+        and filter_.get("expressionType") == "SIMPLE"
+        and filter_.get("clause", "WHERE").upper() == "WHERE"
+        and filter_.get("subject") == subject
+        and filter_.get("operator") == "TEMPORAL_RANGE"
+        and filter_.get("comparator") == NO_TIME_RANGE
+    )
+
+
 class BubbleChartConfig(BaseChartConfig):
     """Config for bubble charts (viz_type ``bubble_v2``).
 
@@ -1152,15 +1167,29 @@ class BubbleChartConfig(BaseChartConfig):
         if not isinstance(data, dict):
             return data
 
+        data = dict(data)
+        generated_temporal_subject = data.pop(MCP_DASHBOARD_TIME_FILTER_SUBJECT, None)
+        if isinstance(generated_temporal_subject, str):
+            data.setdefault("temporal_column", generated_temporal_subject)
+
         for key in ("entity", "series"):
             if isinstance(data.get(key), str):
                 data[key] = {"name": data[key]}
 
         native_filters = data.pop("adhoc_filters", None)
-        if "filters" not in data and isinstance(native_filters, list):
-            data["filters"] = [
-                _coerce_native_bubble_filter(filter_) for filter_ in native_filters
+        if isinstance(native_filters, list):
+            translated_filters = [
+                _coerce_native_bubble_filter(filter_)
+                for filter_ in native_filters
+                if not (
+                    isinstance(generated_temporal_subject, str)
+                    and _is_generated_bubble_temporal_filter(
+                        filter_, generated_temporal_subject
+                    )
+                )
             ]
+            if "filters" not in data and translated_filters:
+                data["filters"] = translated_filters
 
         for key in ("x", "y", "size"):
             data[key] = _coerce_native_bubble_metric(data.get(key))
@@ -1168,7 +1197,7 @@ class BubbleChartConfig(BaseChartConfig):
 
     @model_validator(mode="after")
     def reject_metric_style_dimensions(self) -> "BubbleChartConfig":
-        """entity and series are dimensions, not metrics."""
+        """Validate Bubble dimension and metric positions."""
         dims = [(self.entity, "entity")]
         if self.series is not None:
             dims.append((self.series, "series"))
@@ -1179,6 +1208,13 @@ class BubbleChartConfig(BaseChartConfig):
                     f"{name} must be a plain column, not a metric; drop "
                     "'aggregate'/'saved_metric' (metrics belong in the 'x', "
                     "'y', or 'size' fields)"
+                )
+        for metric, name in ((self.x, "x"), (self.y, "y"), (self.size, "size")):
+            if not metric.is_metric:
+                raise ValueError(
+                    f"{name} must define an aggregate, saved_metric=True, or "
+                    "sql_expression; Bubble position and size fields cannot be "
+                    "plain dimension columns"
                 )
         return self
 
