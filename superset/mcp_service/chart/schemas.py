@@ -1077,10 +1077,16 @@ def _coerce_native_bubble_metric(metric: Any) -> Any:
 
 def _coerce_native_bubble_filter(filter_: Any) -> dict[str, Any]:
     """Translate one supported native adhoc filter into FilterConfig fields."""
+    if not isinstance(filter_, dict):
+        raise ValueError("Bubble adhoc_filters entries must be objects")
+    clause = filter_.get("clause", "WHERE")
+    if not isinstance(clause, str):
+        raise ValueError(
+            "Bubble adhoc_filter clause must be a string ('WHERE' or 'HAVING')"
+        )
     if (
-        not isinstance(filter_, dict)
-        or filter_.get("expressionType") != "SIMPLE"
-        or filter_.get("clause", "WHERE").upper() != "WHERE"
+        filter_.get("expressionType") != "SIMPLE"
+        or clause.upper() != "WHERE"
         or not filter_.get("subject")
         or not filter_.get("operator")
     ):
@@ -1157,7 +1163,6 @@ BUBBLE_NATIVE_PRESENTATION_FIELDS = {
 }
 _BUBBLE_NATIVE_QUERY_FIELDS = {
     "granularity_sqla": "temporal_column",
-    "orderby": "order_by",
     "order_desc": "order_desc",
     "time_range": "time_range",
     "granularity": "granularity",
@@ -1197,6 +1202,7 @@ def _adapt_native_bubble_form_data(  # noqa: C901
         | _BUBBLE_NATIVE_SERVER_FIELDS
         | {
             "adhoc_filters",
+            "orderby",
             "viz_type",
             MCP_DASHBOARD_TIME_FILTER_SUBJECT,
         }
@@ -1224,6 +1230,9 @@ def _adapt_native_bubble_form_data(  # noqa: C901
     for key in ("x", "y", "size"):
         adapted[key] = _coerce_native_bubble_metric(data.get(key))
 
+    if (native_order_by := data.get("orderby")) is not None:
+        adapted["order_by"] = _coerce_native_bubble_metric(native_order_by)
+
     if "adhoc_filters" in data:
         native_filters = data["adhoc_filters"]
         if native_filters is not None and not isinstance(native_filters, list):
@@ -1235,10 +1244,21 @@ def _adapt_native_bubble_form_data(  # noqa: C901
                 )
             translated_filters: list[dict[str, Any]] = []
             for filter_ in native_filters:
+                clause = (
+                    filter_.get("clause", "WHERE")
+                    if isinstance(filter_, dict)
+                    else None
+                )
+                if isinstance(filter_, dict) and not isinstance(clause, str):
+                    raise ValueError(
+                        "Bubble adhoc_filter clause must be a string "
+                        "('WHERE' or 'HAVING')"
+                    )
                 if (
                     isinstance(filter_, dict)
                     and filter_.get("expressionType") == "SIMPLE"
-                    and filter_.get("clause", "WHERE").upper() == "WHERE"
+                    and isinstance(clause, str)
+                    and clause.upper() == "WHERE"
                     and filter_.get("operator") == "TEMPORAL_RANGE"
                     and isinstance(filter_.get("subject"), str)
                 ):
@@ -1332,8 +1352,12 @@ class BubbleChartConfig(BaseChartConfig):
         description="Optional Bubble presentation state; native Explore fields are "
         "adapted into this object during saved/cached form-data round trips",
     )
-    order_by: List[Any] | None = Field(
-        None, description="Optional native metric ordering preserved on round trips"
+    order_by: ColumnRef | None = Field(
+        None,
+        description=(
+            "Optional single metric used to order Bubble rows; native form_data "
+            "stores this as the scalar DndMetricSelect value"
+        ),
     )
     order_desc: bool | None = None
     time_range: str | None = Field(None, max_length=1000)
@@ -1371,7 +1395,10 @@ class BubbleChartConfig(BaseChartConfig):
                     "'aggregate'/'saved_metric' (metrics belong in the 'x', "
                     "'y', or 'size' fields)"
                 )
-        for metric, name in ((self.x, "x"), (self.y, "y"), (self.size, "size")):
+        metric_fields = [(self.x, "x"), (self.y, "y"), (self.size, "size")]
+        if self.order_by is not None:
+            metric_fields.append((self.order_by, "order_by"))
+        for metric, name in metric_fields:
             if not metric.is_metric:
                 raise ValueError(
                     f"{name} must define an aggregate, saved_metric=True, or "

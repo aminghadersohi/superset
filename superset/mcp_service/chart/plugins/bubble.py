@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
+from numbers import Number
 from typing import Any, ClassVar, Literal
 
 from superset.mcp_service.chart.chart_utils import (
@@ -29,8 +31,11 @@ from superset.mcp_service.chart.chart_utils import (
     map_bubble_config,
 )
 from superset.mcp_service.chart.plugin import BaseChartPlugin
-from superset.mcp_service.chart.schemas import BubbleChartConfig, ColumnRef
-from superset.mcp_service.chart.validation.dataset_validator import DatasetValidator
+from superset.mcp_service.chart.schemas import BubbleChartConfig, ChartError, ColumnRef
+from superset.mcp_service.chart.validation.dataset_validator import (
+    DatasetValidator,
+    is_numeric_column,
+)
 from superset.mcp_service.common.error_schemas import ChartGenerationError
 
 BubbleMetricOutputStatus = Literal["numeric", "nonnumeric", "unknown"]
@@ -46,27 +51,9 @@ _NUMERIC_AGGREGATES = {
     "VAR",
     "VAR_SAMP",
 }
-_NUMERIC_METRIC_TYPES = {
-    "count",
-    "count_distinct",
-    "sum",
-    "avg",
-    "average",
-    "median",
-    "percentile",
-    "stddev",
-    "stddev_samp",
-    "var",
-    "var_samp",
-}
 _SIMPLE_IDENTIFIER = re.compile(r'^(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])$')
 _FUNCTION_CALL = re.compile(r"^([A-Za-z_][\w$]*)\s*\((.*)\)$", re.DOTALL)
 _NUMERIC_LITERAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
-_NUMERIC_SQL_TYPE = re.compile(
-    r"\b(?:TINYINT|SMALLINT|INTEGER|INT|BIGINT|FLOAT|DOUBLE|REAL|DECIMAL|"
-    r"NUMERIC|NUMBER|MONEY)\b",
-    re.IGNORECASE,
-)
 _NONNUMERIC_SQL_TYPE = re.compile(
     r"\b(?:CHAR|VARCHAR|STRING|TEXT|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP)\b",
     re.IGNORECASE,
@@ -79,7 +66,7 @@ def _column_output_status(name: str, dataset_context: Any) -> BubbleMetricOutput
         if str(column.get("name", "")).lower() != name.lower():
             continue
         type_name = str(column.get("type") or "").strip().upper()
-        if column.get("is_numeric", False) or _NUMERIC_SQL_TYPE.search(type_name):
+        if is_numeric_column(column):
             return "numeric"
         if type_name not in {"", "UNKNOWN"}:
             return "nonnumeric"
@@ -122,7 +109,7 @@ def _sql_expression_output_status(  # noqa: C901
     )
     if cast_match:
         cast_type = cast_match.group(1).strip()
-        if _NUMERIC_SQL_TYPE.search(cast_type):
+        if is_numeric_column({"type": cast_type}):
             return "numeric"
         if _NONNUMERIC_SQL_TYPE.search(cast_type):
             return "nonnumeric"
@@ -170,12 +157,6 @@ def bubble_metric_output_status(
             )
             if status != "unknown":
                 return status
-            metric_type = saved_metric.get("metric_type")
-            if (
-                isinstance(metric_type, str)
-                and metric_type.lower() in _NUMERIC_METRIC_TYPES
-            ):
-                return "numeric"
             return "unknown"
     return "unknown"
 
@@ -192,6 +173,113 @@ def bubble_metrics_requiring_query_validation(
         if bubble_metric_output_status(getattr(config, field), dataset_context)
         == "unknown"
     ]
+
+
+def _is_finite_numeric(value: Any) -> bool:
+    """Return whether a value is a finite real number, excluding booleans."""
+    if isinstance(value, bool) or not isinstance(value, Number):
+        return False
+    try:
+        return not isinstance(value, complex) and math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def bubble_metric_field(metric: Any) -> str | None:
+    """Return the query-result field name for a native Bubble metric."""
+    if isinstance(metric, str):
+        return metric
+    if not isinstance(metric, dict):
+        return None
+    label = metric.get("label")
+    return label if isinstance(label, str) and label else None
+
+
+def validate_bubble_query_output(
+    data: list[Any],
+    form_data: Mapping[str, Any],
+    *,
+    require_runtime_numeric_proof: bool,
+) -> ChartError | None:
+    """Validate Bubble query shape and quantitative output values.
+
+    An empty result is a valid chart result when dataset metadata or portable
+    expression inference already proves the three metric outputs are numeric.
+    Callers that still need runtime proof must fail closed on an empty result.
+    """
+    entity = form_data.get("entity")
+    metric_fields = {
+        channel: bubble_metric_field(form_data.get(channel))
+        for channel in ("x", "y", "size")
+    }
+    missing_config = [
+        field
+        for field, value in {"entity": entity, **metric_fields}.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing_config:
+        return ChartError(
+            error=(
+                "Bubble query requires entity, x, y, and size form fields; "
+                f"missing or invalid: {', '.join(missing_config)}"
+            ),
+            error_type="InvalidChart",
+        )
+    if not data:
+        if require_runtime_numeric_proof:
+            return ChartError(
+                error=(
+                    "Bubble query returned no rows, so the numeric output of "
+                    "an unproven saved or custom metric could not be verified"
+                ),
+                error_type="InvalidChartData",
+            )
+        return None
+    if not all(isinstance(row, Mapping) for row in data):
+        return ChartError(
+            error="Bubble query returned rows in an unsupported shape",
+            error_type="InvalidChartData",
+        )
+
+    result_fields = {key for row in data for key in row}
+    required_result_fields = {"entity": entity, **metric_fields}
+    series = form_data.get("series")
+    if isinstance(series, str) and series:
+        required_result_fields["series"] = series
+    missing_results = [
+        f"{channel} ({field})"
+        for channel, field in required_result_fields.items()
+        if field not in result_fields
+    ]
+    if missing_results:
+        return ChartError(
+            error=(
+                "Bubble query result is missing required column(s): "
+                + ", ".join(missing_results)
+            ),
+            error_type="InvalidChartData",
+        )
+
+    for channel, field in metric_fields.items():
+        assert isinstance(field, str)
+        samples = [row.get(field) for row in data if row.get(field) is not None]
+        if not samples:
+            return ChartError(
+                error=(
+                    f"Bubble {channel} result column '{field}' has no non-null "
+                    "numeric values"
+                ),
+                error_type="InvalidChartData",
+            )
+        if any(not _is_finite_numeric(value) for value in samples):
+            return ChartError(
+                error=(
+                    f"Bubble {channel} result column '{field}' must contain "
+                    "finite numeric, non-boolean values"
+                ),
+                error_type="InvalidChartData",
+            )
+    return None
 
 
 def _invalid_bubble_metric_output(
@@ -266,6 +354,8 @@ class BubbleChartPlugin(BaseChartPlugin):
         refs: list[ColumnRef] = [config.entity, config.x, config.y, config.size]
         if config.series:
             refs.append(config.series)
+        if config.order_by:
+            refs.append(config.order_by)
         if config.filters:
             for f in config.filters:
                 refs.append(ColumnRef(name=f.column))
@@ -305,7 +395,7 @@ class BubbleChartPlugin(BaseChartPlugin):
                 col["name"] = DatasetValidator.get_canonical_column_name(
                     col["name"], dataset_context
                 )
-        for key in ("x", "y", "size"):
+        for key in ("x", "y", "size", "order_by"):
             metric = config_dict.get(key)
             if not metric:
                 continue

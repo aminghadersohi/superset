@@ -32,6 +32,8 @@ import pytest
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
+from superset.charts.schemas import ChartDataQueryObjectSchema
+from superset.mcp_service.chart.chart_helpers import apply_bubble_ordering
 from superset.mcp_service.chart.chart_utils import (
     analyze_chart_capabilities,
     analyze_chart_semantics,
@@ -174,6 +176,52 @@ class TestBubbleChartConfigSchema:
         assert request.config.x.saved_metric is True
         assert request.config.y.sql_expression is not None
         assert request.config.size.label == "Population"
+
+    @pytest.mark.parametrize("order_desc", [False, True])
+    @pytest.mark.parametrize(
+        "native_order_by",
+        [
+            "saved_order_metric",
+            {
+                "expressionType": "SIMPLE",
+                "column": {"column_name": "population"},
+                "aggregate": "SUM",
+                "label": "SUM(population)",
+            },
+        ],
+    )
+    def test_native_scalar_orderby_round_trips(
+        self, native_order_by: Any, order_desc: bool
+    ) -> None:
+        native = map_bubble_config(BubbleChartConfig(**_base()))
+        native.update({"orderby": native_order_by, "order_desc": order_desc})
+
+        config = UpdateChartRequest.model_validate(
+            {"identifier": 9, "config": native}
+        ).config
+
+        assert isinstance(config, BubbleChartConfig)
+        assert config.order_by is not None
+        assert config.order_by.saved_metric is isinstance(native_order_by, str)
+        remapped = map_bubble_config(config)
+        assert isinstance(remapped["orderby"], str) is isinstance(native_order_by, str)
+        assert remapped["order_desc"] is order_desc
+
+    @pytest.mark.parametrize("clause", [None, 7])
+    def test_native_filter_clause_requires_string(self, clause: Any) -> None:
+        native = map_bubble_config(BubbleChartConfig(**_base()))
+        native["adhoc_filters"] = [
+            {
+                "expressionType": "SIMPLE",
+                "clause": clause,
+                "subject": "country",
+                "operator": "==",
+                "comparator": "France",
+            }
+        ]
+
+        with pytest.raises(ValidationError, match="clause must be a string"):
+            UpdateChartRequest.model_validate({"identifier": 9, "config": native})
 
     @pytest.mark.parametrize("invalid_filters", [{}, "bad", 17])
     def test_native_malformed_filter_container_rejected(
@@ -454,6 +502,42 @@ class TestBubbleMetricsResolution:
 
         assert columns == ["country", "continent"]
         assert labels == ["AVG(gdp)", "AVG(life_expectancy)", "SUM(population)"]
+
+    @pytest.mark.parametrize("order_desc", [False, True])
+    @pytest.mark.parametrize(
+        "order_by",
+        [
+            "saved_order_metric",
+            {
+                "expressionType": "SIMPLE",
+                "column": {"column_name": "population"},
+                "aggregate": "SUM",
+                "label": "SUM(population)",
+            },
+        ],
+    )
+    def test_bubble_ordering_matches_query_object_schema(
+        self, order_by: Any, order_desc: bool
+    ) -> None:
+        form_data = {"viz_type": "bubble_v2", "orderby": order_by}
+        form_data["order_desc"] = order_desc
+        query: dict[str, Any] = {"columns": ["country"], "metrics": ["count"]}
+
+        apply_bubble_ordering(query, form_data)
+        loaded = ChartDataQueryObjectSchema().load(query)
+
+        assert query["orderby"] == [[order_by, not order_desc]]
+        assert loaded["orderby"] == [(order_by, not order_desc)]
+
+    def test_bubble_ordering_uses_frontend_descending_default(self) -> None:
+        query: dict[str, Any] = {}
+
+        apply_bubble_ordering(
+            query,
+            {"viz_type": "bubble_v2", "orderby": "saved_order_metric"},
+        )
+
+        assert query["orderby"] == [["saved_order_metric", False]]
 
     @patch("superset.commands.chart.data.get_data_command.ChartDataCommand")
     @patch("superset.common.query_context_factory.QueryContextFactory")

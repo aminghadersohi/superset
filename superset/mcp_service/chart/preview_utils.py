@@ -24,8 +24,6 @@ from form data without requiring a saved chart object.
 
 import logging
 import math
-from collections.abc import Mapping
-from numbers import Number
 from typing import Any, Dict, List
 
 from superset.mcp_service.chart.schemas import (
@@ -40,24 +38,11 @@ logger = logging.getLogger(__name__)
 SUPPORTED_FORM_DATA_PREVIEW_FORMATS = frozenset({"ascii", "table", "vega_lite"})
 
 
-def _is_finite_numeric(value: Any) -> bool:
-    """Return whether a value is a finite real number, excluding booleans."""
-    if isinstance(value, bool) or not isinstance(value, Number):
-        return False
-    try:
-        return not isinstance(value, complex) and math.isfinite(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return False
-
-
 def _bubble_metric_field(metric: Any) -> str | None:
-    """Return the query-result field name for a native Bubble metric."""
-    if isinstance(metric, str):
-        return metric
-    if not isinstance(metric, dict):
-        return None
-    label = metric.get("label")
-    return label if isinstance(label, str) and label else None
+    """Compatibility wrapper around Bubble's shared result-field resolver."""
+    from superset.mcp_service.chart.plugins.bubble import bubble_metric_field
+
+    return bubble_metric_field(metric)
 
 
 def _build_bubble_vega_lite_spec(
@@ -123,132 +108,47 @@ def _build_bubble_vega_lite_spec(
 def _validate_bubble_preview_data(
     data: List[Any], form_data: Dict[str, Any]
 ) -> ChartError | None:
-    """Validate Bubble's required result fields and quantitative samples."""
-    entity = form_data.get("entity")
-    metric_fields = {
-        channel: _bubble_metric_field(form_data.get(channel))
-        for channel in ("x", "y", "size")
-    }
-    missing_config = [
-        field
-        for field, value in {"entity": entity, **metric_fields}.items()
-        if not isinstance(value, str) or not value
-    ]
-    if missing_config:
-        return ChartError(
-            error=(
-                "Bubble preview requires entity, x, y, and size form fields; "
-                f"missing or invalid: {', '.join(missing_config)}"
-            ),
-            error_type="InvalidChart",
-        )
+    """Require both valid Bubble query output and renderable preview rows."""
+    from superset.mcp_service.chart.plugins.bubble import (
+        validate_bubble_query_output,
+    )
+
+    output_error = validate_bubble_query_output(
+        data,
+        form_data,
+        require_runtime_numeric_proof=False,
+    )
+    if output_error is not None:
+        return output_error
     if not data:
         return ChartError(
             error="No data available for Vega-Lite visualization",
             error_type="NoDataError",
         )
-    if not all(isinstance(row, Mapping) for row in data):
-        return ChartError(
-            error="Bubble query returned rows in an unsupported shape",
-            error_type="InvalidChartData",
-        )
-
-    result_fields = {key for row in data for key in row}
-    required_result_fields = {
-        "entity": entity,
-        **metric_fields,
-    }
-    series = form_data.get("series")
-    if isinstance(series, str) and series:
-        required_result_fields["series"] = series
-    missing_results = [
-        f"{channel} ({field})"
-        for channel, field in required_result_fields.items()
-        if field not in result_fields
-    ]
-    if missing_results:
-        return ChartError(
-            error=(
-                "Bubble query result is missing required column(s): "
-                + ", ".join(missing_results)
-            ),
-            error_type="InvalidChartData",
-        )
-
-    for channel, field in metric_fields.items():
-        # The config validation above establishes that every value is a string.
-        assert isinstance(field, str)
-        samples = [row.get(field) for row in data if row.get(field) is not None]
-        if not samples:
-            return ChartError(
-                error=(
-                    f"Bubble {channel} result column '{field}' has no non-null "
-                    "numeric values"
-                ),
-                error_type="InvalidChartData",
-            )
-        if any(not _is_finite_numeric(value) for value in samples):
-            return ChartError(
-                error=(
-                    f"Bubble {channel} result column '{field}' must contain "
-                    "finite numeric, non-boolean values"
-                ),
-                error_type="InvalidChartData",
-            )
     return None
 
 
 def _build_query_columns(form_data: Dict[str, Any]) -> list[Any]:
-    """Build query columns list from form_data, including both x_axis and groupby.
+    """Compatibility wrapper around the shared query-column builder."""
+    from superset.mcp_service.chart.chart_helpers import build_query_columns
 
-    Delegates to the shared builder so the MCP and dashboard-export paths stay in
-    sync (single source of truth).
-    """
-    from superset.common.form_data_query_context import columns_from_form_data
-
-    columns = columns_from_form_data(form_data)
-    if not columns:
-        for column in list(form_data.get("groupbyRows") or []) + list(
-            form_data.get("groupbyColumns") or []
-        ):
-            if column not in columns:
-                columns.append(column)
-    for column in form_data.get("groupby_b") or []:
-        if column not in columns:
-            columns.append(column)
-    return columns
+    return build_query_columns(form_data)
 
 
 def _build_query_metrics(form_data: Dict[str, Any]) -> list[Any]:
-    """Resolve primary and secondary metrics through shared chart helpers."""
-    from superset.mcp_service.chart.chart_helpers import resolve_metrics_and_groupby
+    """Compatibility wrapper around the shared query-metric builder."""
+    from superset.mcp_service.chart.chart_helpers import build_query_metrics
 
-    metrics, _ = resolve_metrics_and_groupby(form_data)
-    for metric in form_data.get("metrics_b") or []:
-        if metric not in metrics:
-            metrics.append(metric)
-    return metrics
+    return build_query_metrics(form_data)
 
 
 def _build_query_fields(
     form_data: Dict[str, Any],
 ) -> tuple[list[Any], list[Any]]:
-    """Resolve query columns and metrics using chart-aware shared helpers."""
-    from superset.mcp_service.chart.chart_helpers import (
-        resolve_metrics_and_groupby,
-    )
+    """Compatibility wrapper around the shared query-field builder."""
+    from superset.mcp_service.chart.chart_helpers import build_query_fields
 
-    _, chart_columns = resolve_metrics_and_groupby(form_data)
-    metrics = _build_query_metrics(form_data)
-    columns = _build_query_columns(form_data)
-    for column in chart_columns:
-        if column not in columns:
-            columns.append(column)
-
-    # Big Number with trendline uses granularity_sqla as the time column.
-    if not columns and form_data.get("granularity_sqla"):
-        columns = [form_data["granularity_sqla"]]
-    return columns, metrics
+    return build_query_fields(form_data)
 
 
 def generate_preview_from_form_data(
@@ -279,31 +179,34 @@ def generate_preview_from_form_data(
 
         # Create query context from form data using factory
         from superset.common.query_context_factory import QueryContextFactory
+        from superset.mcp_service.chart.chart_helpers import (
+            apply_bubble_ordering,
+            build_query_fields,
+        )
         from superset.mcp_service.chart.chart_utils import (
             adhoc_filters_to_query_filters,
         )
 
         # Resolve standard query fields plus chart-specific aliases such as
         # Bubble's entity/series dimensions and x/y/size metrics.
-        columns, metrics = _build_query_fields(form_data)
+        columns, metrics = build_query_fields(form_data)
 
         query_filters = adhoc_filters_to_query_filters(
             form_data.get("adhoc_filters", [])
         )
 
         factory = QueryContextFactory()
+        query: dict[str, Any] = {
+            "columns": columns,
+            "metrics": metrics,
+            "row_limit": form_data.get("row_limit", 100),
+            "filters": query_filters,
+            "time_range": form_data.get("time_range", "No filter"),
+        }
+        apply_bubble_ordering(query, form_data)
         query_context_obj = factory.create(
             datasource={"id": dataset_id, "type": "table"},
-            queries=[
-                {
-                    "columns": columns,
-                    "metrics": metrics,
-                    "orderby": form_data.get("orderby", []),
-                    "row_limit": form_data.get("row_limit", 100),
-                    "filters": query_filters,
-                    "time_range": form_data.get("time_range", "No filter"),
-                }
-            ],
+            queries=[query],
             form_data=form_data,
         )
 

@@ -1087,7 +1087,7 @@ def map_bubble_config(config: BubbleChartConfig) -> Dict[str, Any]:
     if config.series:
         form_data["series"] = config.series.name
     if config.order_by is not None:
-        form_data["orderby"] = config.order_by
+        form_data["orderby"] = create_metric_object(config.order_by)
     if config.order_desc is not None:
         form_data["order_desc"] = config.order_desc
     if config.time_range is not None:

@@ -41,6 +41,7 @@ from superset.mcp_service.chart.chart_utils import (
     generate_chart_name,
     generate_explore_link,
     map_config_to_form_data,
+    merge_bubble_presentation_config,
     merge_interactive_pivot_ui_config,
     merge_table_column_config,
     NO_TIME_RANGE,
@@ -242,6 +243,7 @@ def update_chart_preview(  # noqa: C901
             if previous_form_data:
                 merge_table_column_config(previous_form_data, new_form_data)
                 merge_interactive_pivot_ui_config(previous_form_data, new_form_data)
+                merge_bubble_presentation_config(previous_form_data, new_form_data)
 
             # Tier-1 schema validation against the dataset (no DB roundtrip).
             # Runs AFTER the filter merge so filter columns are also validated.

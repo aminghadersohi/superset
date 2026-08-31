@@ -100,6 +100,8 @@ class CompileResult:
 def _compile_chart(
     form_data: Dict[str, Any],
     dataset_id: int,
+    *,
+    bubble_runtime_validation_required: bool = True,
 ) -> CompileResult:
     """Execute the chart's query to verify it renders without errors.
 
@@ -117,28 +119,31 @@ def _compile_chart(
         ChartDataQueryFailedError,
     )
     from superset.common.query_context_factory import QueryContextFactory
+    from superset.mcp_service.chart.chart_helpers import (
+        apply_bubble_ordering,
+        build_query_fields,
+    )
     from superset.mcp_service.chart.chart_utils import adhoc_filters_to_query_filters
-    from superset.mcp_service.chart.preview_utils import _build_query_fields
 
     try:
-        columns, metrics = _build_query_fields(form_data)
+        columns, metrics = build_query_fields(form_data)
         query_filters = adhoc_filters_to_query_filters(
             form_data.get("adhoc_filters", [])
         )
 
+        query: dict[str, Any] = {
+            "columns": columns,
+            "metrics": metrics,
+            "row_limit": 2,
+            "filters": query_filters,
+            "time_range": form_data.get("time_range", "No filter"),
+        }
+        apply_bubble_ordering(query, form_data)
+
         factory = QueryContextFactory()
         query_context = factory.create(
             datasource={"id": dataset_id, "type": "table"},
-            queries=[
-                {
-                    "columns": columns,
-                    "metrics": metrics,
-                    "orderby": form_data.get("orderby", []),
-                    "row_limit": 2,
-                    "filters": query_filters,
-                    "time_range": form_data.get("time_range", "No filter"),
-                }
-            ],
+            queries=[query],
             form_data=form_data,
         )
 
@@ -165,26 +170,28 @@ def _compile_chart(
             row_count += len(query_data)
 
         if form_data.get("viz_type") == "bubble_v2":
-            from superset.mcp_service.chart.preview_utils import (
-                _validate_bubble_preview_data,
+            from superset.mcp_service.chart.plugins.bubble import (
+                validate_bubble_query_output,
             )
 
-            if output_error := _validate_bubble_preview_data(
-                first_query_data, form_data
+            if output_error := validate_bubble_query_output(
+                first_query_data,
+                form_data,
+                require_runtime_numeric_proof=bubble_runtime_validation_required,
             ):
                 error = ChartGenerationError(
                     error_type=output_error.error_type,
                     message=output_error.message,
                     details=(
-                        "Bubble compile validation requires x, y, and size to "
-                        "produce usable quantitative result columns."
+                        "Bubble query validation requires x, y, and size to "
+                        "produce quantitative result columns."
                     ),
                     suggestions=[
                         "Use numeric metrics for Bubble x, y, and size",
                         "Verify custom labels match the returned metric aliases",
                         "Use COUNT or COUNT_DISTINCT when aggregating text",
                     ],
-                    error_code="INVALID_BUBBLE_PREVIEW_DATA",
+                    error_code="INVALID_BUBBLE_QUERY_DATA",
                 )
                 return CompileResult(
                     success=False,
@@ -278,7 +285,19 @@ def _validate_adhoc_filter_columns(
         column = f.get("subject") or f.get("col")
         if not column or not isinstance(column, str):
             continue
-        clause = f.get("clause", "WHERE").upper()
+        raw_clause = f.get("clause", "WHERE")
+        if not isinstance(raw_clause, str):
+            return ChartGenerationError(
+                error_type="invalid_filter",
+                message="Adhoc filter clause must be a string ('WHERE' or 'HAVING')",
+                details=(
+                    "Each active SIMPLE adhoc filter must use a string SQL clause; "
+                    f"received {type(raw_clause).__name__}."
+                ),
+                suggestions=["Set the filter clause to 'WHERE' or 'HAVING'"],
+                error_code="CHART_VALIDATION_FAILED",
+            )
+        clause = raw_clause.upper()
         if not _adhoc_filter_column_valid(column, clause, dataset_context):
             invalid.append(column)
 
@@ -459,12 +478,16 @@ def validate_and_compile(
                 error_obj=filter_error,
             )
 
-    if not run_compile_check and dataset_context is not None:
+    bubble_runtime_validation_required = False
+    if dataset_context is not None:
         from superset.mcp_service.chart.plugins.bubble import (
             bubble_metrics_requiring_query_validation,
         )
 
-        if bubble_metrics_requiring_query_validation(config, dataset_context):
+        bubble_runtime_validation_required = bool(
+            bubble_metrics_requiring_query_validation(config, dataset_context)
+        )
+        if not run_compile_check and bubble_runtime_validation_required:
             # Saved/custom SQL metrics without authoritative output metadata or
             # portable static inference need one small result query before a
             # no-compile preview path may accept them.
@@ -473,4 +496,8 @@ def validate_and_compile(
     if not run_compile_check:
         return CompileResult(success=True)
 
-    return _compile_chart(form_data, dataset.id)
+    return _compile_chart(
+        form_data,
+        dataset.id,
+        bubble_runtime_validation_required=bubble_runtime_validation_required,
+    )

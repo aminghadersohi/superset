@@ -35,14 +35,14 @@ from superset.mcp_service.chart.ascii_charts import (
     generate_ascii_table,
 )
 from superset.mcp_service.chart.chart_helpers import (
+    build_query_columns as _shared_build_query_columns,
     build_query_context_from_form_data,
+    build_query_metrics as _shared_build_query_metrics,
     find_chart_by_identifier,
 )
 from superset.mcp_service.chart.chart_utils import validate_chart_dataset
 from superset.mcp_service.chart.preview_utils import (
     _build_bubble_vega_lite_spec,
-    _build_query_columns as _shared_build_query_columns,
-    _build_query_metrics as _shared_build_query_metrics,
     _validate_bubble_preview_data,
 )
 from superset.mcp_service.chart.schemas import (
