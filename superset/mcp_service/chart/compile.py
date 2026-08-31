@@ -148,6 +148,7 @@ def _compile_chart(
 
         warnings: List[str] = []
         row_count = 0
+        first_query_data: list[Any] = []
         for query in result.get("queries", []):
             if query.get("error"):
                 error_str = str(query["error"])
@@ -158,7 +159,40 @@ def _compile_chart(
                     tier="compile",
                     error_obj=_build_compile_error(error_str),
                 )
-            row_count += len(query.get("data", []))
+            query_data = query.get("data", [])
+            if not first_query_data:
+                first_query_data = query_data
+            row_count += len(query_data)
+
+        if form_data.get("viz_type") == "bubble_v2":
+            from superset.mcp_service.chart.preview_utils import (
+                _validate_bubble_preview_data,
+            )
+
+            if output_error := _validate_bubble_preview_data(
+                first_query_data, form_data
+            ):
+                error = ChartGenerationError(
+                    error_type=output_error.error_type,
+                    message=output_error.message,
+                    details=(
+                        "Bubble compile validation requires x, y, and size to "
+                        "produce usable quantitative result columns."
+                    ),
+                    suggestions=[
+                        "Use numeric metrics for Bubble x, y, and size",
+                        "Verify custom labels match the returned metric aliases",
+                        "Use COUNT or COUNT_DISTINCT when aggregating text",
+                    ],
+                    error_code="INVALID_BUBBLE_PREVIEW_DATA",
+                )
+                return CompileResult(
+                    success=False,
+                    error=output_error.message,
+                    error_code=error.error_code,
+                    tier="compile",
+                    error_obj=error,
+                )
 
         return CompileResult(success=True, warnings=warnings, row_count=row_count)
     except (ChartDataQueryFailedError, ChartDataCacheLoadError) as exc:
@@ -424,6 +458,17 @@ def validate_and_compile(
                 tier="validation",
                 error_obj=filter_error,
             )
+
+    if not run_compile_check and dataset_context is not None:
+        from superset.mcp_service.chart.plugins.bubble import (
+            bubble_metrics_requiring_query_validation,
+        )
+
+        if bubble_metrics_requiring_query_validation(config, dataset_context):
+            # Saved/custom SQL metrics without authoritative output metadata or
+            # portable static inference need one small result query before a
+            # no-compile preview path may accept them.
+            run_compile_check = True
 
     if not run_compile_check:
         return CompileResult(success=True)

@@ -24,6 +24,8 @@ from form data without requiring a saved chart object.
 
 import logging
 import math
+from collections.abc import Mapping
+from numbers import Number
 from typing import Any, Dict, List
 
 from superset.mcp_service.chart.schemas import (
@@ -36,6 +38,16 @@ from superset.mcp_service.chart.schemas import (
 logger = logging.getLogger(__name__)
 
 SUPPORTED_FORM_DATA_PREVIEW_FORMATS = frozenset({"ascii", "table", "vega_lite"})
+
+
+def _is_finite_numeric(value: Any) -> bool:
+    """Return whether a value is a finite real number, excluding booleans."""
+    if isinstance(value, bool) or not isinstance(value, Number):
+        return False
+    try:
+        return not isinstance(value, complex) and math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _bubble_metric_field(metric: Any) -> str | None:
@@ -108,6 +120,84 @@ def _build_bubble_vega_lite_spec(
     }
 
 
+def _validate_bubble_preview_data(
+    data: List[Any], form_data: Dict[str, Any]
+) -> ChartError | None:
+    """Validate Bubble's required result fields and quantitative samples."""
+    entity = form_data.get("entity")
+    metric_fields = {
+        channel: _bubble_metric_field(form_data.get(channel))
+        for channel in ("x", "y", "size")
+    }
+    missing_config = [
+        field
+        for field, value in {"entity": entity, **metric_fields}.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing_config:
+        return ChartError(
+            error=(
+                "Bubble preview requires entity, x, y, and size form fields; "
+                f"missing or invalid: {', '.join(missing_config)}"
+            ),
+            error_type="InvalidChart",
+        )
+    if not data:
+        return ChartError(
+            error="No data available for Vega-Lite visualization",
+            error_type="NoDataError",
+        )
+    if not all(isinstance(row, Mapping) for row in data):
+        return ChartError(
+            error="Bubble query returned rows in an unsupported shape",
+            error_type="InvalidChartData",
+        )
+
+    result_fields = {key for row in data for key in row}
+    required_result_fields = {
+        "entity": entity,
+        **metric_fields,
+    }
+    series = form_data.get("series")
+    if isinstance(series, str) and series:
+        required_result_fields["series"] = series
+    missing_results = [
+        f"{channel} ({field})"
+        for channel, field in required_result_fields.items()
+        if field not in result_fields
+    ]
+    if missing_results:
+        return ChartError(
+            error=(
+                "Bubble query result is missing required column(s): "
+                + ", ".join(missing_results)
+            ),
+            error_type="InvalidChartData",
+        )
+
+    for channel, field in metric_fields.items():
+        # The config validation above establishes that every value is a string.
+        assert isinstance(field, str)
+        samples = [row.get(field) for row in data if row.get(field) is not None]
+        if not samples:
+            return ChartError(
+                error=(
+                    f"Bubble {channel} result column '{field}' has no non-null "
+                    "numeric values"
+                ),
+                error_type="InvalidChartData",
+            )
+        if any(not _is_finite_numeric(value) for value in samples):
+            return ChartError(
+                error=(
+                    f"Bubble {channel} result column '{field}' must contain "
+                    "finite numeric, non-boolean values"
+                ),
+                error_type="InvalidChartData",
+            )
+    return None
+
+
 def _build_query_columns(form_data: Dict[str, Any]) -> list[Any]:
     """Build query columns list from form_data, including both x_axis and groupby.
 
@@ -116,7 +206,28 @@ def _build_query_columns(form_data: Dict[str, Any]) -> list[Any]:
     """
     from superset.common.form_data_query_context import columns_from_form_data
 
-    return columns_from_form_data(form_data)
+    columns = columns_from_form_data(form_data)
+    if not columns:
+        for column in list(form_data.get("groupbyRows") or []) + list(
+            form_data.get("groupbyColumns") or []
+        ):
+            if column not in columns:
+                columns.append(column)
+    for column in form_data.get("groupby_b") or []:
+        if column not in columns:
+            columns.append(column)
+    return columns
+
+
+def _build_query_metrics(form_data: Dict[str, Any]) -> list[Any]:
+    """Resolve primary and secondary metrics through shared chart helpers."""
+    from superset.mcp_service.chart.chart_helpers import resolve_metrics_and_groupby
+
+    metrics, _ = resolve_metrics_and_groupby(form_data)
+    for metric in form_data.get("metrics_b") or []:
+        if metric not in metrics:
+            metrics.append(metric)
+    return metrics
 
 
 def _build_query_fields(
@@ -127,7 +238,8 @@ def _build_query_fields(
         resolve_metrics_and_groupby,
     )
 
-    metrics, chart_columns = resolve_metrics_and_groupby(form_data)
+    _, chart_columns = resolve_metrics_and_groupby(form_data)
+    metrics = _build_query_metrics(form_data)
     columns = _build_query_columns(form_data)
     for column in chart_columns:
         if column not in columns:
@@ -552,11 +664,13 @@ def _is_nan(value: Any) -> bool:
 
 def _generate_vega_lite_preview_from_data(  # noqa: C901
     data: List[Dict[str, Any]], form_data: Dict[str, Any]
-) -> VegaLitePreview:
+) -> VegaLitePreview | ChartError:
     """Generate Vega-Lite preview from raw data and form_data."""
     viz_type = form_data.get("viz_type", "table")
 
     if viz_type == "bubble_v2":
+        if error := _validate_bubble_preview_data(data, form_data):
+            return error
         spec = _build_bubble_vega_lite_spec(data, form_data)
         spec["width"] = "container"
         spec["height"] = 400

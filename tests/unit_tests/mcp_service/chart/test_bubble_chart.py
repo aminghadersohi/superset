@@ -24,9 +24,12 @@ registry integration.
 """
 
 from copy import deepcopy
+from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+import yaml
 from pydantic import TypeAdapter, ValidationError
 
 from superset.mcp_service.chart.chart_utils import (
@@ -43,6 +46,7 @@ from superset.mcp_service.chart.preview_utils import (
 from superset.mcp_service.chart.schemas import (
     BubbleChartConfig,
     ChartConfig,
+    ChartError,
     GenerateChartRequest,
     GetChartPreviewRequest,
     UpdateChartRequest,
@@ -170,6 +174,139 @@ class TestBubbleChartConfigSchema:
         assert request.config.x.saved_metric is True
         assert request.config.y.sql_expression is not None
         assert request.config.size.label == "Population"
+
+    @pytest.mark.parametrize("invalid_filters", [{}, "bad", 17])
+    def test_native_malformed_filter_container_rejected(
+        self, invalid_filters: object
+    ) -> None:
+        with pytest.raises(ValidationError, match="adhoc_filters must be a list"):
+            UpdateChartRequest.model_validate(
+                {
+                    "identifier": 9,
+                    "config": {
+                        "viz_type": "bubble_v2",
+                        "entity": "country",
+                        "x": "saved_x",
+                        "y": "saved_y",
+                        "size": "saved_size",
+                        "adhoc_filters": invalid_filters,
+                    },
+                }
+            )
+
+    def test_native_null_filter_container_is_accepted(self) -> None:
+        request = GenerateChartRequest.model_validate(
+            {
+                "dataset_id": 7,
+                "config": {
+                    "viz_type": "bubble_v2",
+                    "entity": "country",
+                    "x": "saved_x",
+                    "y": "saved_y",
+                    "size": "saved_size",
+                    "adhoc_filters": None,
+                },
+            }
+        )
+        assert isinstance(request.config, BubbleChartConfig)
+        assert request.config.filters is None
+
+    def test_native_typo_rejected_without_weakening_typed_schema(self) -> None:
+        with pytest.raises(ValidationError, match="opacitiy.*opacity"):
+            UpdateChartRequest.model_validate(
+                {
+                    "identifier": 9,
+                    "config": {
+                        "viz_type": "bubble_v2",
+                        "entity": "country",
+                        "x": "saved_x",
+                        "y": "saved_y",
+                        "size": "saved_size",
+                        "opacitiy": 0.4,
+                    },
+                }
+            )
+        with pytest.raises(ValidationError, match="Unknown field 'opacity'"):
+            BubbleChartConfig.model_validate(_base(opacity=0.4))
+
+    @pytest.mark.parametrize(
+        "fixture_path",
+        [
+            "superset/examples/featured_charts/charts/Bubble.yaml",
+            "superset/examples/world_health/charts/Life_Expectancy_VS_Rural.yaml",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("request_type", "request_fields"),
+        [
+            (GenerateChartRequest, {"dataset_id": 7}),
+            (UpdateChartRequest, {"identifier": 9}),
+        ],
+    )
+    def test_repository_bubble_yaml_native_params_are_accepted_and_preserved(
+        self,
+        fixture_path: str,
+        request_type,
+        request_fields: dict[str, int],
+    ) -> None:
+        params = yaml.safe_load(Path(fixture_path).read_text())["params"]
+
+        request = request_type.model_validate(
+            {**request_fields, "config": deepcopy(params)}
+        )
+
+        assert isinstance(request.config, BubbleChartConfig)
+        remapped = map_bubble_config(request.config)
+        for key in (
+            "annotation_layers",
+            "legendOrientation",
+            "legendType",
+            "max_bubble_size",
+            "opacity",
+            "show_legend",
+            "tooltipSizeFormat",
+            "truncateXAxis",
+        ):
+            if key in params:
+                assert remapped[key] == params[key]
+        if params.get("time_range"):
+            assert remapped["time_range"] == params["time_range"]
+
+    def test_cached_native_state_accepts_server_fields_and_preserves_ui(self) -> None:
+        native = map_bubble_config(BubbleChartConfig(**_base()))
+        native.update(
+            {
+                "datasource": "7__table",
+                "slice_id": 9,
+                "extra_form_data": {"filters": []},
+                "extra_filters": [],
+                "dashboardId": 4,
+                "force": False,
+                "granularity_sqla": "event_date",
+                "queryFields": {"entity": "groupby"},
+                "result_format": "json",
+                "result_type": "full",
+                "annotation_layers": [],
+                "max_bubble_size": "75",
+                "opacity": 0.4,
+                "legendMargin": 12,
+                "legendSort": "asc",
+                "xAxisFormat": "$,.2f",
+                "tooltipSizeFormat": ",.0f",
+            }
+        )
+
+        request = UpdateChartRequest.model_validate({"identifier": 9, "config": native})
+        assert isinstance(request.config, BubbleChartConfig)
+        assert request.config.temporal_column == "event_date"
+        remapped = map_bubble_config(request.config)
+        assert remapped["max_bubble_size"] == "75"
+        assert remapped["opacity"] == 0.4
+        assert remapped["legendMargin"] == 12
+        assert remapped["legendSort"] == "asc"
+        assert remapped["xAxisFormat"] == "$,.2f"
+        assert remapped["tooltipSizeFormat"] == ",.0f"
+        assert "datasource" not in remapped
 
     @pytest.mark.parametrize(
         ("request_type", "request_fields"),
@@ -324,7 +461,20 @@ class TestBubbleMetricsResolution:
         self, mock_factory_cls: MagicMock, mock_command_cls: MagicMock
     ) -> None:
         mock_factory_cls.return_value.create.return_value = MagicMock()
-        mock_command_cls.return_value.run.return_value = {"queries": [{"data": []}]}
+        mock_command_cls.return_value.run.return_value = {
+            "queries": [
+                {
+                    "data": [
+                        {
+                            "country": "France",
+                            "AVG(gdp)": 44000,
+                            "AVG(life_expectancy)": 82.3,
+                            "SUM(population)": 68_000_000,
+                        }
+                    ]
+                }
+            ]
+        }
         form_data = map_bubble_config(BubbleChartConfig(**_base()))
 
         result = _compile_chart(form_data, dataset_id=7)
@@ -379,6 +529,125 @@ class TestBubbleVegaLitePreview:
             "AVG(life_expectancy)",
             "SUM(population)",
         ]
+
+    def _saved_strategy(self, form_data: dict[str, Any]) -> VegaLitePreviewStrategy:
+        chart = Mock(
+            id=9,
+            viz_type="bubble_v2",
+            params=json.dumps(form_data),
+            slice_name="Economic outlook",
+            datasource_id=7,
+            datasource_type="table",
+        )
+        return VegaLitePreviewStrategy(
+            chart,
+            GetChartPreviewRequest(identifier=9, format="vega_lite"),
+        )
+
+    @pytest.mark.parametrize(
+        ("mutate_form_data", "data", "error_type"),
+        [
+            (lambda fd: fd.pop("x"), [], "InvalidChart"),
+            (lambda fd: None, [], "NoDataError"),
+            (
+                lambda fd: None,
+                [
+                    {
+                        "country": "France",
+                        "AVG(gdp)": 44000,
+                        "AVG(life_expectancy)": 82.3,
+                    }
+                ],
+                "InvalidChartData",
+            ),
+            (
+                lambda fd: None,
+                [
+                    {
+                        "country": "France",
+                        "AVG(gdp)": "high",
+                        "AVG(life_expectancy)": 82.3,
+                        "SUM(population)": 68_000_000,
+                    }
+                ],
+                "InvalidChartData",
+            ),
+            (
+                lambda fd: None,
+                [
+                    {
+                        "country": "France",
+                        "AVG(gdp)": True,
+                        "AVG(life_expectancy)": 82.3,
+                        "SUM(population)": 68_000_000,
+                    }
+                ],
+                "InvalidChartData",
+            ),
+            (
+                lambda fd: None,
+                [
+                    {
+                        "country": "France",
+                        "AVG(gdp)": None,
+                        "AVG(life_expectancy)": 82.3,
+                        "SUM(population)": 68_000_000,
+                    }
+                ],
+                "InvalidChartData",
+            ),
+        ],
+    )
+    def test_saved_and_unsaved_bubble_preview_errors_match(
+        self, mutate_form_data, data: list[dict[str, Any]], error_type: str
+    ) -> None:
+        form_data = map_bubble_config(BubbleChartConfig(**_base()))
+        mutate_form_data(form_data)
+
+        unsaved = _generate_vega_lite_preview_from_data(data, form_data)
+        with (
+            patch(
+                "superset.mcp_service.chart.tool.get_chart_preview."
+                "build_query_context_from_form_data",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "superset.commands.chart.data.get_data_command.ChartDataCommand"
+            ) as command_cls,
+        ):
+            command_cls.return_value.run.return_value = {"queries": [{"data": data}]}
+            saved = self._saved_strategy(form_data).generate()
+
+        assert isinstance(unsaved, ChartError)
+        assert isinstance(saved, ChartError)
+        assert unsaved.error_type == saved.error_type == error_type
+        assert unsaved.message == saved.message
+
+    def test_custom_metric_aliases_are_required_result_fields(self) -> None:
+        form_data = map_bubble_config(
+            BubbleChartConfig(
+                **_base(x={"name": "gdp", "aggregate": "AVG", "label": "GDP"})
+            )
+        )
+        valid_data = [
+            {
+                "country": "France",
+                "GDP": 44000,
+                "AVG(life_expectancy)": 82.3,
+                "SUM(population)": 68_000_000,
+            }
+        ]
+        preview = _generate_vega_lite_preview_from_data(valid_data, form_data)
+        assert not isinstance(preview, ChartError)
+        assert preview.specification["encoding"]["x"]["field"] == "GDP"
+
+        invalid_data = [
+            {key: value for key, value in valid_data[0].items() if key != "GDP"}
+        ]
+        invalid_data[0]["AVG(gdp)"] = 44000
+        error = _generate_vega_lite_preview_from_data(invalid_data, form_data)
+        assert isinstance(error, ChartError)
+        assert error.error_type == "InvalidChartData"
 
     def test_saved_bubble_preview_uses_native_metric_fields(self) -> None:
         form_data = map_bubble_config(BubbleChartConfig(**_base()))

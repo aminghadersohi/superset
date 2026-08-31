@@ -40,6 +40,7 @@ from superset.mcp_service.chart.chart_helpers import (
 from superset.mcp_service.chart.schemas import (
     BigNumberChartConfig,
     BoxPlotChartConfig,
+    BUBBLE_NATIVE_PRESENTATION_FIELDS,
     BubbleChartConfig,
     ChartCapabilities,
     ChartConfig,
@@ -600,6 +601,26 @@ def merge_interactive_pivot_ui_config(
         new_form_data["pivot_table_state"] = {**existing_state, **new_state}
 
 
+def merge_bubble_presentation_config(
+    existing_form_data: Mapping[str, Any], new_form_data: Dict[str, Any]
+) -> None:
+    """Preserve UI-managed Bubble presentation fields on typed updates.
+
+    Query-defining fields (entity, metrics, filters, ordering, and time range)
+    remain controlled by the replacement config. Presentation values supplied
+    explicitly by a native Bubble round trip win; otherwise the saved UI state
+    survives an MCP update.
+    """
+    if (
+        existing_form_data.get("viz_type") != "bubble_v2"
+        or new_form_data.get("viz_type") != "bubble_v2"
+    ):
+        return
+    for key in BUBBLE_NATIVE_PRESENTATION_FIELDS:
+        if key in existing_form_data and key not in new_form_data:
+            new_form_data[key] = existing_form_data[key]
+
+
 def create_metric_object(col: ColumnRef) -> Dict[str, Any] | str:
     """Create a metric object for a column with enhanced validation.
 
@@ -1065,6 +1086,23 @@ def map_bubble_config(config: BubbleChartConfig) -> Dict[str, Any]:
     }
     if config.series:
         form_data["series"] = config.series.name
+    if config.order_by is not None:
+        form_data["orderby"] = config.order_by
+    if config.order_desc is not None:
+        form_data["order_desc"] = config.order_desc
+    if config.time_range is not None:
+        form_data["time_range"] = config.time_range
+    if config.granularity is not None:
+        form_data["granularity"] = config.granularity
+    if config.presentation is not None:
+        presentation = config.presentation.model_dump(exclude_none=True)
+        form_data.update(
+            {
+                native_key: presentation[typed_key]
+                for native_key, typed_key in BUBBLE_NATIVE_PRESENTATION_FIELDS.items()
+                if typed_key in presentation
+            }
+        )
     _add_adhoc_filters(form_data, config.filters)
     return form_data
 

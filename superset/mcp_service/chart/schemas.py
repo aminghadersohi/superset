@@ -1054,11 +1054,14 @@ def _coerce_native_bubble_metric(metric: Any) -> Any:
         return {"name": metric, "saved_metric": True}
     if not isinstance(metric, dict) or "expressionType" not in metric:
         return metric
-    if metric.get("expressionType") == "SQL":
+    expression_type = metric.get("expressionType")
+    if expression_type == "SQL":
         return {
             "sql_expression": metric.get("sqlExpression"),
             "label": metric.get("label"),
         }
+    if expression_type != "SIMPLE":
+        raise ValueError("Bubble metrics must use SIMPLE or SQL expressionType values")
 
     column = metric.get("column")
     if isinstance(column, dict):
@@ -1093,16 +1096,188 @@ def _coerce_native_bubble_filter(filter_: Any) -> dict[str, Any]:
     }
 
 
-def _is_generated_bubble_temporal_filter(filter_: Any, subject: str) -> bool:
-    """Return whether a native filter is the generated neutral time binding."""
-    return (
-        isinstance(filter_, dict)
-        and filter_.get("expressionType") == "SIMPLE"
-        and filter_.get("clause", "WHERE").upper() == "WHERE"
-        and filter_.get("subject") == subject
-        and filter_.get("operator") == "TEMPORAL_RANGE"
-        and filter_.get("comparator") == NO_TIME_RANGE
+class BubblePresentationConfig(UnknownFieldCheckMixin):
+    """Bubble UI state accepted from native Explore/chart form data."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    annotation_layers: List[Dict[str, Any]] | None = None
+    legend_orientation: LEGEND_POSITION_LITERAL | None = None
+    legend_type: Literal["plain", "scroll"] | None = None
+    legend_margin: int | str | None = None
+    legend_sort: Literal["asc", "desc"] | None = None
+    max_bubble_size: int | str | None = None
+    opacity: float | None = Field(None, ge=0, le=1)
+    show_legend: bool | None = None
+    tooltip_size_format: str | None = Field(None, max_length=100)
+    truncate_x_axis: bool | None = None
+    truncate_y_axis: bool | None = None
+    x_axis_format: str | None = Field(None, max_length=100)
+    y_axis_format: str | None = Field(None, max_length=100)
+    x_axis_label: str | None = Field(None, max_length=500)
+    y_axis_label: str | None = Field(None, max_length=500)
+    x_axis_title_margin: int | str | None = None
+    y_axis_title_margin: int | str | None = None
+    x_axis_label_rotation: int | float | None = None
+    y_axis_label_rotation: int | float | None = None
+    x_axis_label_interval: int | str | None = None
+    x_axis_bounds: List[float | None] | None = Field(None, min_length=2, max_length=2)
+    y_axis_bounds: List[float | None] | None = Field(None, min_length=2, max_length=2)
+    log_x_axis: bool | None = None
+    log_y_axis: bool | None = None
+    emit_filter: bool | None = None
+
+
+BUBBLE_NATIVE_PRESENTATION_FIELDS = {
+    "annotation_layers": "annotation_layers",
+    "legendOrientation": "legend_orientation",
+    "legendType": "legend_type",
+    "legendMargin": "legend_margin",
+    "legendSort": "legend_sort",
+    "max_bubble_size": "max_bubble_size",
+    "opacity": "opacity",
+    "show_legend": "show_legend",
+    "tooltipSizeFormat": "tooltip_size_format",
+    "truncateXAxis": "truncate_x_axis",
+    "truncateYAxis": "truncate_y_axis",
+    "xAxisFormat": "x_axis_format",
+    "y_axis_format": "y_axis_format",
+    "x_axis_label": "x_axis_label",
+    "y_axis_label": "y_axis_label",
+    "x_axis_title_margin": "x_axis_title_margin",
+    "y_axis_title_margin": "y_axis_title_margin",
+    "xAxisLabelRotation": "x_axis_label_rotation",
+    "yAxisLabelRotation": "y_axis_label_rotation",
+    "xAxisLabelInterval": "x_axis_label_interval",
+    "x_axis_bounds": "x_axis_bounds",
+    "y_axis_bounds": "y_axis_bounds",
+    "logXAxis": "log_x_axis",
+    "logYAxis": "log_y_axis",
+    "emit_filter": "emit_filter",
+}
+_BUBBLE_NATIVE_QUERY_FIELDS = {
+    "granularity_sqla": "temporal_column",
+    "orderby": "order_by",
+    "order_desc": "order_desc",
+    "time_range": "time_range",
+    "granularity": "granularity",
+}
+_BUBBLE_NATIVE_SERVER_FIELDS = {
+    "cache_timeout",
+    "dashboardId",
+    "dashboards",
+    "datasource",
+    "extra_filters",
+    "extra_form_data",
+    "force",
+    "result_format",
+    "result_type",
+    "queryFields",
+    "slice_id",
+    "slice_name",
+    "url_params",
+}
+
+
+def _adapt_native_bubble_form_data(  # noqa: C901
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert a deliberate native Bubble payload into the typed MCP shape.
+
+    Only payloads carrying ``viz_type=bubble_v2`` enter this adapter. Native
+    fields are either translated, explicitly treated as server-owned metadata,
+    or rejected as likely typos. Typed ``chart_type=bubble`` creation retains
+    the normal strict unknown-field checks.
+    """
+    typed_fields = _get_known_fields(BubbleChartConfig)
+    allowed = (
+        typed_fields
+        | set(BUBBLE_NATIVE_PRESENTATION_FIELDS)
+        | set(_BUBBLE_NATIVE_QUERY_FIELDS)
+        | _BUBBLE_NATIVE_SERVER_FIELDS
+        | {
+            "adhoc_filters",
+            "viz_type",
+            MCP_DASHBOARD_TIME_FILTER_SUBJECT,
+        }
     )
+    if unknown := set(data) - allowed:
+        field = sorted(unknown)[0]
+        matches = difflib.get_close_matches(field, sorted(allowed), n=1, cutoff=0.6)
+        hint = f" — did you mean '{matches[0]}'?" if matches else ""
+        raise ValueError(f"Unknown native Bubble field '{field}'{hint}")
+
+    adapted = {key: value for key, value in data.items() if key in typed_fields}
+    adapted["chart_type"] = "bubble"
+    adapted.pop("viz_type", None)
+    if adapted.get("row_limit") is None:
+        adapted.pop("row_limit", None)
+
+    generated_temporal_subject = data.get(MCP_DASHBOARD_TIME_FILTER_SUBJECT)
+    if isinstance(generated_temporal_subject, str):
+        adapted.setdefault("temporal_column", generated_temporal_subject)
+
+    for key in ("entity", "series"):
+        if isinstance(data.get(key), str):
+            adapted[key] = {"name": data[key]}
+
+    for key in ("x", "y", "size"):
+        adapted[key] = _coerce_native_bubble_metric(data.get(key))
+
+    if "adhoc_filters" in data:
+        native_filters = data["adhoc_filters"]
+        if native_filters is not None and not isinstance(native_filters, list):
+            raise ValueError("Bubble adhoc_filters must be a list or null")
+        if native_filters is not None:
+            if "filters" in data:
+                raise ValueError(
+                    "Pass either native adhoc_filters or typed filters, not both"
+                )
+            translated_filters: list[dict[str, Any]] = []
+            for filter_ in native_filters:
+                if (
+                    isinstance(filter_, dict)
+                    and filter_.get("expressionType") == "SIMPLE"
+                    and filter_.get("clause", "WHERE").upper() == "WHERE"
+                    and filter_.get("operator") == "TEMPORAL_RANGE"
+                    and isinstance(filter_.get("subject"), str)
+                ):
+                    subject = filter_["subject"]
+                    selected = adapted.get("temporal_column")
+                    if selected is not None and selected != subject:
+                        raise ValueError(
+                            "Bubble native form_data contains conflicting "
+                            "TEMPORAL_RANGE filter subjects"
+                        )
+                    adapted["temporal_column"] = subject
+                    comparator = filter_.get("comparator")
+                    if comparator not in (None, NO_TIME_RANGE):
+                        adapted["time_range"] = comparator
+                    continue
+                translated_filters.append(_coerce_native_bubble_filter(filter_))
+            adapted["filters"] = translated_filters
+
+    presentation = dict(adapted.get("presentation") or {})
+    for native_key, typed_key in BUBBLE_NATIVE_PRESENTATION_FIELDS.items():
+        if native_key in data:
+            presentation[typed_key] = data[native_key]
+    if presentation:
+        adapted["presentation"] = presentation
+
+    for native_key, typed_key in _BUBBLE_NATIVE_QUERY_FIELDS.items():
+        if native_key in data:
+            if data[native_key] is None:
+                continue
+            if (
+                typed_key == "temporal_column"
+                and adapted.get(typed_key) is not None
+                and adapted[typed_key] != data[native_key]
+            ):
+                raise ValueError(
+                    "Bubble native form_data contains conflicting temporal columns"
+                )
+            adapted[typed_key] = data[native_key]
+    return adapted
 
 
 class BubbleChartConfig(BaseChartConfig):
@@ -1152,6 +1327,17 @@ class BubbleChartConfig(BaseChartConfig):
         ),
         max_length=100,
     )
+    presentation: BubblePresentationConfig | None = Field(
+        None,
+        description="Optional Bubble presentation state; native Explore fields are "
+        "adapted into this object during saved/cached form-data round trips",
+    )
+    order_by: List[Any] | None = Field(
+        None, description="Optional native metric ordering preserved on round trips"
+    )
+    order_desc: bool | None = None
+    time_range: str | None = Field(None, max_length=1000)
+    granularity: str | None = Field(None, max_length=255)
 
     @model_validator(mode="before")
     @classmethod
@@ -1167,32 +1353,8 @@ class BubbleChartConfig(BaseChartConfig):
         if not isinstance(data, dict):
             return data
 
-        data = dict(data)
-        generated_temporal_subject = data.pop(MCP_DASHBOARD_TIME_FILTER_SUBJECT, None)
-        if isinstance(generated_temporal_subject, str):
-            data.setdefault("temporal_column", generated_temporal_subject)
-
-        for key in ("entity", "series"):
-            if isinstance(data.get(key), str):
-                data[key] = {"name": data[key]}
-
-        native_filters = data.pop("adhoc_filters", None)
-        if isinstance(native_filters, list):
-            translated_filters = [
-                _coerce_native_bubble_filter(filter_)
-                for filter_ in native_filters
-                if not (
-                    isinstance(generated_temporal_subject, str)
-                    and _is_generated_bubble_temporal_filter(
-                        filter_, generated_temporal_subject
-                    )
-                )
-            ]
-            if "filters" not in data and translated_filters:
-                data["filters"] = translated_filters
-
-        for key in ("x", "y", "size"):
-            data[key] = _coerce_native_bubble_metric(data.get(key))
+        if data.get("viz_type") == "bubble_v2" or data.get("chart_type") == "bubble_v2":
+            return _adapt_native_bubble_form_data(dict(data))
         return data
 
     @model_validator(mode="after")
@@ -2527,6 +2689,10 @@ def _normalize_chart_request_input(data: Any) -> Any:
     config = data.get("config")
     if isinstance(config, dict):
         viz_type = config.get("viz_type")
+        if viz_type == "bubble_v2":
+            config = _adapt_native_bubble_form_data(config)
+            data["config"] = config
+            viz_type = None
         if isinstance(viz_type, str) and "chart_type" not in config:
             config["chart_type"] = viz_type
         chart_type = config.get("chart_type")

@@ -180,6 +180,102 @@ class TestValidateAndCompileChartTypeCoverage:
 
         assert result.success, result.error
 
+    @pytest.mark.parametrize("aggregate", ["MIN", "MAX"])
+    @pytest.mark.parametrize("field", ["x", "y", "size"])
+    def test_bubble_min_max_on_text_rejected(self, aggregate, field):
+        ds = _orm_dataset()
+        metrics = {
+            "x": ColumnRef(name="num", aggregate="AVG"),
+            "y": ColumnRef(name="num", aggregate="MAX"),
+            "size": ColumnRef(name="num", aggregate="SUM"),
+        }
+        metrics[field] = ColumnRef(name="gender", aggregate=aggregate)
+
+        result = validate_and_compile(
+            BubbleChartConfig(entity=ColumnRef(name="name"), **metrics),
+            {},
+            ds,
+            run_compile_check=False,
+        )
+
+        assert not result.success
+        assert result.error_obj is not None
+        assert result.error_obj.error_code == "INVALID_BUBBLE_METRIC_OUTPUT"
+
+    @pytest.mark.parametrize("aggregate", ["COUNT", "COUNT_DISTINCT"])
+    def test_bubble_count_over_text_is_numeric(self, aggregate):
+        ds = _orm_dataset()
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="gender", aggregate=aggregate),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+
+        assert result.success, result.error
+
+    @pytest.mark.parametrize(
+        ("metric", "passes"),
+        [
+            (ColumnRef(name="saved_text", saved_metric=True), False),
+            (ColumnRef(name="saved_count", saved_metric=True), True),
+            (ColumnRef(name="saved_sum", saved_metric=True), True),
+            (ColumnRef(sql_expression="MAX(gender)", label="Text max"), False),
+            (ColumnRef(sql_expression="COUNT(gender)", label="Count"), True),
+            (
+                ColumnRef(sql_expression="SUM(num)", label="Custom numeric alias"),
+                True,
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("field", ["x", "y", "size"])
+    def test_bubble_saved_and_sql_metric_output_inference(self, metric, passes, field):
+        ds = _orm_dataset(metric_names=["saved_text", "saved_count", "saved_sum"])
+        expressions = {
+            "saved_text": "MAX(gender)",
+            "saved_count": "COUNT(gender)",
+            "saved_sum": "SUM(num)",
+        }
+        for saved_metric in ds.metrics:
+            saved_metric.expression = expressions[saved_metric.metric_name]
+            saved_metric.metric_type = None
+            saved_metric.d3format = None
+        metrics = {
+            "x": ColumnRef(name="num", aggregate="AVG"),
+            "y": ColumnRef(name="num", aggregate="MAX"),
+            "size": ColumnRef(name="num", aggregate="SUM"),
+        }
+        metrics[field] = metric
+        config = BubbleChartConfig(entity=ColumnRef(name="name"), **metrics)
+
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+
+        assert result.success is passes
+        if not passes:
+            assert result.error_obj is not None
+            assert result.error_obj.error_code == "INVALID_BUBBLE_METRIC_OUTPUT"
+
+    @patch("superset.mcp_service.chart.compile._compile_chart")
+    def test_unproven_saved_metric_forces_query_on_tier_one_path(self, mock_compile):
+        ds = _orm_dataset(metric_names=["complex_metric"])
+        ds.metrics[0].expression = "SOME_VENDOR_FUNCTION(gender)"
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="complex_metric", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_compile.return_value = CompileResult(success=True)
+
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+
+        assert result.success
+        mock_compile.assert_called_once_with({}, ds.id)
+
     def test_pivot_table_bad_row_rejected(self):
         ds = _orm_dataset()
         config = PivotTableChartConfig(
