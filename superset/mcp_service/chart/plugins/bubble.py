@@ -20,8 +20,8 @@
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from numbers import Number
 from typing import Any, ClassVar, Literal
 
@@ -51,18 +51,57 @@ _NUMERIC_AGGREGATES = {
     "VAR",
     "VAR_SAMP",
 }
-_SIMPLE_IDENTIFIER = re.compile(r'^(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])$')
-_FUNCTION_PREFIX = re.compile(r"^([A-Za-z_][\w$]*)\s*\(")
-_NUMERIC_LITERAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
-_SIMPLE_CAST_TYPE = re.compile(
-    r"^(?P<name>[A-Za-z_][\w$]*|DOUBLE\s+PRECISION)"
-    r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?$",
-    re.IGNORECASE,
-)
-_NONNUMERIC_SQL_TYPE = re.compile(
-    r"\b(?:CHAR|VARCHAR|STRING|TEXT|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP)\b",
-    re.IGNORECASE,
-)
+_SET_AGGREGATES = _COUNT_AGGREGATES | _NUMERIC_AGGREGATES | {"MIN", "MAX"}
+
+# Saved metrics are stored as MediumText and do not pass through ColumnRef's
+# 2,000-character bound. Keep static inference deliberately smaller than a SQL
+# parser: every input is scanned once and any exceeded budget fails closed to a
+# validating query.
+_MAX_SQL_EXPRESSION_LENGTH = 16_384
+_MAX_SQL_EXPRESSION_TOKENS = 2_048
+_MAX_SQL_EXPRESSION_DEPTH = 64
+_MAX_SQL_CLASSIFICATION_WORK = 4_096
+
+_SqlTokenKind = Literal[
+    "identifier",
+    "quoted_identifier",
+    "number",
+    "string",
+    "left_parenthesis",
+    "right_parenthesis",
+    "comma",
+    "comment",
+    "other",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _SqlToken:
+    """One structural SQL token used by conservative Bubble type inference."""
+
+    kind: _SqlTokenKind
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenizedSql:
+    """Bounded token stream plus precomputed parenthesis relationships."""
+
+    tokens: tuple[_SqlToken, ...]
+    matching_parentheses: dict[int, int]
+    comment_prefix: tuple[int, ...]
+    has_nested_set_aggregate: bool
+
+
+@dataclass(slots=True)
+class _ClassificationBudget:
+    """Deterministic work allowance for token-span classification."""
+
+    remaining: int = _MAX_SQL_CLASSIFICATION_WORK
+
+    def spend(self, amount: int = 1) -> bool:
+        self.remaining -= amount
+        return self.remaining >= 0
 
 
 def _column_output_status(name: str, dataset_context: Any) -> BubbleMetricOutputStatus:
@@ -89,141 +128,217 @@ def _unquote_identifier(value: str) -> str:
     return value
 
 
-def _matching_closing_parenthesis(  # noqa: C901
-    sql: str, opening: int
-) -> int | None:
-    """Return the parenthesis matching ``opening``, ignoring quoted SQL/comments.
-
-    Quotes and comments are scanned in place rather than removed so their
-    contents cannot change the apparent parenthesis structure.
-    """
-    depth = 0
-    quote: str | None = None
-    comment: Literal["line", "block"] | None = None
-    index = opening
-    while index < len(sql):
-        char = sql[index]
-        if comment == "line":
-            if char in {"\r", "\n"}:
-                comment = None
-        elif comment == "block":
-            if sql.startswith("*/", index):
-                comment = None
-                index += 1
-        elif quote is not None:
-            if quote == "]":
-                if char == "]":
-                    if index + 1 < len(sql) and sql[index + 1] == "]":
-                        index += 1
-                    else:
-                        quote = None
-            elif char == "\\":
-                # Some engines support backslash escapes in quoted values.
-                index += 1
-            elif char == quote:
-                if index + 1 < len(sql) and sql[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-        elif char in {"'", '"', "`"}:
-            quote = char
-        elif char == "[":
-            quote = "]"
-        elif sql.startswith("--", index):
-            comment = "line"
-            index += 1
-        elif sql.startswith("/*", index):
-            comment = "block"
-            index += 1
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-            if depth < 0:
-                return None
-        index += 1
-    return None
+def _is_identifier_start(char: str) -> bool:
+    return char == "_" or char.isalpha()
 
 
-def _strip_balanced_outer_parentheses(sql: str) -> str:
-    """Remove only parentheses that enclose the complete expression."""
-    while sql.startswith("("):
-        closing = _matching_closing_parenthesis(sql, 0)
-        if closing != len(sql) - 1:
-            break
-        sql = sql[1:-1].strip()
-    return sql
+def _is_identifier_part(char: str) -> bool:
+    return char in {"_", "$"} or char.isalnum()
 
 
-def _parse_outer_function_call(sql: str) -> tuple[str, str] | None:
-    """Parse a single balanced outermost function call, without trailing SQL."""
-    match = _FUNCTION_PREFIX.match(sql)
-    if match is None:
+def _tokenize_sql(expression: str) -> _TokenizedSql | None:  # noqa: C901
+    """Tokenize SQL once, returning ``None`` when a safety budget is exceeded."""
+    if len(expression) > _MAX_SQL_EXPRESSION_LENGTH:
         return None
-    opening = match.end() - 1
-    if _matching_closing_parenthesis(sql, opening) != len(sql) - 1:
-        return None
-    return match.group(1).upper(), sql[opening + 1 : -1].strip()
 
-
-def _parse_cast_type(argument: str) -> str | None:  # noqa: C901
-    """Return an unambiguous, comment-free outer CAST target type."""
-    depth = 0
-    quote: str | None = None
-    as_positions: list[int] = []
+    tokens: list[_SqlToken] = []
+    parentheses: list[int] = []
+    matching_parentheses: dict[int, int] = {}
     index = 0
-    while index < len(argument):
-        char = argument[index]
-        if quote is not None:
-            if quote == "]":
-                if char == "]":
-                    if index + 1 < len(argument) and argument[index + 1] == "]":
-                        index += 1
-                    else:
-                        quote = None
-            elif char == "\\":
+    length = len(expression)
+
+    while index < length:
+        char = expression[index]
+        if char.isspace():
+            index += 1
+            continue
+
+        start = index
+        kind: _SqlTokenKind
+        if expression.startswith("--", index):
+            index += 2
+            while index < length and expression[index] not in {"\r", "\n"}:
                 index += 1
-            elif char == quote:
-                if index + 1 < len(argument) and argument[index + 1] == quote:
-                    index += 1
-                else:
-                    quote = None
-        elif char in {"'", '"', "`"}:
-            quote = char
-        elif char == "[":
-            quote = "]"
-        elif argument.startswith(("--", "/*"), index):
-            # Do not rewrite SQL before type inference. A commented CAST is
-            # intentionally left for runtime validation instead.
-            return None
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
+            kind = "comment"
+        elif expression.startswith("/*", index):
+            comment_end = expression.find("*/", index + 2)
+            if comment_end < 0:
                 return None
+            index = comment_end + 2
+            kind = "comment"
+        elif char in {"'", '"', "`", "["}:
+            closing_quote = "]" if char == "[" else char
+            index += 1
+            while index < length:
+                current = expression[index]
+                if current == "\\" and closing_quote != "]":
+                    index += 2
+                    continue
+                if current == closing_quote:
+                    if index + 1 < length and expression[index + 1] == closing_quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            else:
+                return None
+            kind = "string" if char == "'" else "quoted_identifier"
+        elif _is_identifier_start(char):
+            index += 1
+            while index < length and _is_identifier_part(expression[index]):
+                index += 1
+            kind = "identifier"
         elif (
-            depth == 0
-            and argument[index : index + 2].upper() == "AS"
-            and (index == 0 or not re.match(r"[\w$]", argument[index - 1]))
-            and (
-                index + 2 == len(argument)
-                or not re.match(r"[\w$]", argument[index + 2])
+            char.isdigit()
+            or (char == "." and index + 1 < length and expression[index + 1].isdigit())
+            or (
+                char in {"+", "-"}
+                and index + 1 < length
+                and (
+                    expression[index + 1].isdigit()
+                    or (
+                        expression[index + 1] == "."
+                        and index + 2 < length
+                        and expression[index + 2].isdigit()
+                    )
+                )
             )
         ):
-            as_positions.append(index)
+            if char in {"+", "-"}:
+                index += 1
+            while index < length and expression[index].isdigit():
+                index += 1
+            if index < length and expression[index] == ".":
+                index += 1
+                while index < length and expression[index].isdigit():
+                    index += 1
+            kind = "number"
+        else:
             index += 1
+            if char == "(":
+                kind = "left_parenthesis"
+            elif char == ")":
+                kind = "right_parenthesis"
+            elif char == ",":
+                kind = "comma"
+            else:
+                kind = "other"
+
+        token_index = len(tokens)
+        tokens.append(_SqlToken(kind, expression[start:index]))
+        if len(tokens) > _MAX_SQL_EXPRESSION_TOKENS:
+            return None
+        if kind == "left_parenthesis":
+            parentheses.append(token_index)
+            if len(parentheses) > _MAX_SQL_EXPRESSION_DEPTH:
+                return None
+        elif kind == "right_parenthesis":
+            if not parentheses:
+                return None
+            matching_parentheses[parentheses.pop()] = token_index
+
+    if parentheses or not tokens:
+        return None
+
+    comment_prefix = [0]
+    for token in tokens:
+        comment_prefix.append(comment_prefix[-1] + (token.kind == "comment"))
+
+    active_aggregate_closings: list[int] = []
+    has_nested_set_aggregate = False
+    for token_index, token in enumerate(tokens):
+        while active_aggregate_closings and token_index > active_aggregate_closings[-1]:
+            active_aggregate_closings.pop()
+        if (
+            token.kind == "identifier"
+            and token.text.upper() in _SET_AGGREGATES
+            and token_index + 1 < len(tokens)
+            and tokens[token_index + 1].kind == "left_parenthesis"
+        ):
+            closing = matching_parentheses.get(token_index + 1)
+            if closing is None:
+                return None
+            if active_aggregate_closings:
+                has_nested_set_aggregate = True
+                break
+            active_aggregate_closings.append(closing)
+
+    return _TokenizedSql(
+        tokens=tuple(tokens),
+        matching_parentheses=matching_parentheses,
+        comment_prefix=tuple(comment_prefix),
+        has_nested_set_aggregate=has_nested_set_aggregate,
+    )
+
+
+def _parse_cast_type(  # noqa: C901
+    parsed: _TokenizedSql,
+    start: int,
+    end: int,
+    budget: _ClassificationBudget,
+) -> str | None:
+    """Return a simple, comment-free CAST target type from an argument span."""
+    if start > end or parsed.comment_prefix[end + 1] != parsed.comment_prefix[start]:
+        return None
+
+    tokens = parsed.tokens
+    as_position: int | None = None
+    index = start
+    while index <= end:
+        if not budget.spend():
+            return None
+        token = tokens[index]
+        if token.kind == "left_parenthesis":
+            closing = parsed.matching_parentheses.get(index)
+            if closing is None or closing > end:
+                return None
+            index = closing + 1
+            continue
+        if token.kind == "identifier" and token.text.upper() == "AS":
+            if as_position is not None:
+                return None
+            as_position = index
         index += 1
 
-    if quote is not None or depth != 0 or len(as_positions) != 1:
+    if as_position is None:
         return None
-    cast_type = argument[as_positions[0] + 2 :].strip()
-    type_match = _SIMPLE_CAST_TYPE.fullmatch(cast_type)
-    if type_match is None:
+    type_tokens = tokens[as_position + 1 : end + 1]
+    if not type_tokens or type_tokens[0].kind != "identifier":
         return None
-    return cast_type
+
+    base_type = type_tokens[0].text.upper()
+    type_index = 1
+    if (
+        base_type == "DOUBLE"
+        and len(type_tokens) > 1
+        and type_tokens[1].kind == "identifier"
+        and type_tokens[1].text.upper() == "PRECISION"
+    ):
+        base_type = "DOUBLE PRECISION"
+        type_index = 2
+    if type_index == len(type_tokens):
+        return base_type
+
+    parameters = type_tokens[type_index:]
+    if (
+        len(parameters) not in {3, 5}
+        or parameters[0].kind != "left_parenthesis"
+        or parameters[-1].kind != "right_parenthesis"
+        or not parameters[1].text.isdigit()
+        or parameters[1].kind != "number"
+    ):
+        return None
+    if len(parameters) == 5 and (
+        parameters[2].kind != "comma"
+        or parameters[3].kind != "number"
+        or not parameters[3].text.isdigit()
+    ):
+        return None
+    values = [parameters[1].text]
+    if len(parameters) == 5:
+        values.append(parameters[3].text)
+    return f"{base_type}({', '.join(values)})"
 
 
 def _sql_expression_output_status(  # noqa: C901
@@ -235,41 +350,78 @@ def _sql_expression_output_status(  # noqa: C901
     engines. Expressions that cannot be proven statically are validated from a
     small query result by the compile/preview paths.
     """
-    if not expression or not expression.strip():
+    if not expression:
         return "unknown"
-    sql = _strip_balanced_outer_parentheses(expression.strip())
-
-    if _SIMPLE_IDENTIFIER.fullmatch(sql):
-        return _column_output_status(_unquote_identifier(sql), dataset_context)
-    if _NUMERIC_LITERAL.fullmatch(sql):
-        return "numeric"
-    if sql.startswith("'") and sql.endswith("'"):
-        return "nonnumeric"
-
-    function_call = _parse_outer_function_call(sql)
-    if function_call is None:
+    parsed = _tokenize_sql(expression)
+    if parsed is None or parsed.has_nested_set_aggregate:
         return "unknown"
-    function, argument = function_call
 
-    if function in {"CAST", "TRY_CAST"}:
-        cast_type = _parse_cast_type(argument)
-        if cast_type is None:
+    tokens = parsed.tokens
+    start = 0
+    end = len(tokens) - 1
+    budget = _ClassificationBudget()
+    while start <= end and budget.spend():
+        while (
+            start < end
+            and tokens[start].kind == "left_parenthesis"
+            and parsed.matching_parentheses.get(start) == end
+        ):
+            if not budget.spend():
+                return "unknown"
+            start += 1
+            end -= 1
+
+        if start == end:
+            token = tokens[start]
+            if token.kind in {"identifier", "quoted_identifier"}:
+                return _column_output_status(
+                    _unquote_identifier(token.text), dataset_context
+                )
+            if token.kind == "number":
+                return "numeric"
+            if token.kind == "string":
+                return "nonnumeric"
             return "unknown"
-        if is_numeric_column({"type": cast_type}):
+
+        if (
+            tokens[start].kind != "identifier"
+            or start + 1 > end
+            or tokens[start + 1].kind != "left_parenthesis"
+            or parsed.matching_parentheses.get(start + 1) != end
+        ):
+            return "unknown"
+        function = tokens[start].text.upper()
+        argument_start = start + 2
+        argument_end = end - 1
+
+        if function in {"CAST", "TRY_CAST"}:
+            cast_type = _parse_cast_type(parsed, argument_start, argument_end, budget)
+            if cast_type is None:
+                return "unknown"
+            if is_numeric_column({"type": cast_type}):
+                return "numeric"
+            if cast_type.split("(", 1)[0] in {
+                "CHAR",
+                "VARCHAR",
+                "STRING",
+                "TEXT",
+                "BOOLEAN",
+                "BOOL",
+                "DATE",
+                "TIME",
+                "TIMESTAMP",
+            }:
+                return "nonnumeric"
+            return "unknown"
+        if function in _COUNT_AGGREGATES:
             return "numeric"
-        if _NONNUMERIC_SQL_TYPE.search(cast_type):
-            return "nonnumeric"
+        if function in _NUMERIC_AGGREGATES or function in {"MIN", "MAX"}:
+            # Continue through one wrapper chain without recursive calls or
+            # substring rescans. Unknown compound arguments fail closed.
+            start = argument_start
+            end = argument_end
+            continue
         return "unknown"
-    if function in _COUNT_AGGREGATES:
-        return "numeric"
-    if function in _NUMERIC_AGGREGATES:
-        # Numeric aggregates prove their output type only when their complete
-        # argument is itself proven numeric. This deliberately recurses through
-        # balanced wrappers and CAST parsing instead of assuming every complex
-        # argument is numeric; ambiguous expressions require runtime proof.
-        return _sql_expression_output_status(argument, dataset_context)
-    if function in {"MIN", "MAX"}:
-        return _sql_expression_output_status(argument, dataset_context)
     return "unknown"
 
 

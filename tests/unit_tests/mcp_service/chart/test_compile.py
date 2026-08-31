@@ -23,6 +23,7 @@ path so fast-path tools (``generate_explore_link``, ``update_chart_preview``)
 that only use Tier-1 validation are exercised end-to-end.
 """
 
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -33,6 +34,10 @@ from superset.mcp_service.chart.compile import (
     validate_and_compile,
 )
 from superset.mcp_service.chart.plugins.bubble import (
+    _MAX_SQL_EXPRESSION_DEPTH,
+    _MAX_SQL_EXPRESSION_LENGTH,
+    _MAX_SQL_EXPRESSION_TOKENS,
+    _tokenize_sql,
     bubble_metric_output_status,
     bubble_metrics_requiring_query_validation,
 )
@@ -425,12 +430,181 @@ class TestValidateAndCompileChartTypeCoverage:
         )
 
     @pytest.mark.parametrize(
+        "expression",
+        [
+            "SUM(AVG(num))",
+            "MAX(SUM(num))",
+            "SUM(AVG(CAST(num AS DECIMAL(10, 2))))",
+        ],
+    )
+    @patch("superset.mcp_service.chart.compile._compile_chart")
+    def test_bubble_nested_set_aggregate_forces_query_on_no_compile_path(
+        self, mock_compile: Mock, expression: str
+    ) -> None:
+        """Invalid nested set aggregates must not receive static numeric proof."""
+        ds = _orm_dataset(metric_names=["nested_aggregate"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="nested_aggregate", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_compile.return_value = CompileResult(success=True)
+
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+
+        assert result.success
+        mock_compile.assert_called_once_with(
+            {}, ds.id, bubble_runtime_validation_required=True
+        )
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "SUM(AVG(num))",
+            "MAX(SUM(num))",
+            "SUM(AVG(CAST(num AS DECIMAL(10, 2))))",
+        ],
+    )
+    @patch("superset.commands.chart.data.get_data_command.ChartDataCommand")
+    @patch("superset.common.query_context_factory.QueryContextFactory")
+    def test_empty_bubble_nested_set_aggregate_fails_closed(
+        self,
+        mock_factory: Mock,
+        mock_command: Mock,
+        expression: str,
+    ) -> None:
+        """An empty result cannot validate an invalid nested set aggregate."""
+        ds = _orm_dataset(metric_names=["nested_aggregate"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="nested_aggregate", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_factory.return_value.create.return_value = Mock()
+        mock_command.return_value.run.return_value = {"queries": [{"data": []}]}
+
+        result = validate_and_compile(
+            config,
+            map_bubble_config(config),
+            ds,
+            run_compile_check=False,
+        )
+
+        assert not result.success
+        assert result.error_obj is not None
+        assert result.error_obj.error_code == "INVALID_BUBBLE_QUERY_DATA"
+        assert "could not be verified" in result.error_obj.message
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "SUM(" * 1_200 + "num" + ")" * 1_200,
+            "(" * 4_000 + "SUM(num)" + ")" * 4_000,
+        ],
+    )
+    @patch("superset.mcp_service.chart.compile._compile_chart")
+    def test_long_saved_metric_fails_to_runtime_proof_quickly(
+        self, mock_compile: Mock, expression: str
+    ) -> None:
+        """MediumText metrics beyond ColumnRef's limit remain bounded and safe."""
+        assert len(expression) > 2_000
+        ds = _orm_dataset(metric_names=["deep_metric"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="deep_metric", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_compile.return_value = CompileResult(success=True)
+
+        started = time.process_time()
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+        elapsed = time.process_time() - started
+
+        assert result.success
+        assert elapsed < 1.0
+        mock_compile.assert_called_once_with(
+            {}, ds.id, bubble_runtime_validation_required=True
+        )
+
+    @patch("superset.mcp_service.chart.compile._compile_chart")
+    def test_saved_metric_depth_and_length_budget_boundaries(
+        self, mock_compile: Mock
+    ) -> None:
+        """The documented static-inference depth and work bounds fail closed."""
+        ds = _orm_dataset(metric_names=["boundary_metric"])
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="boundary_metric", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+
+        within_depth = (
+            "(" * (_MAX_SQL_EXPRESSION_DEPTH - 1)
+            + "SUM(num)"
+            + ")" * (_MAX_SQL_EXPRESSION_DEPTH - 1)
+        )
+        ds.metrics[0].expression = within_depth
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+        assert result.success
+        mock_compile.assert_not_called()
+
+        beyond_depth = f"({within_depth})"
+        ds.metrics[0].expression = beyond_depth
+        mock_compile.return_value = CompileResult(success=True)
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+        assert result.success
+        mock_compile.assert_called_once_with(
+            {}, ds.id, bubble_runtime_validation_required=True
+        )
+
+        mock_compile.reset_mock()
+        within_length = "SUM(num)".ljust(_MAX_SQL_EXPRESSION_LENGTH)
+        ds.metrics[0].expression = within_length
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+        assert result.success
+        mock_compile.assert_not_called()
+
+        ds.metrics[0].expression = within_length + " "
+        result = validate_and_compile(config, {}, ds, run_compile_check=False)
+        assert result.success
+        mock_compile.assert_called_once_with(
+            {}, ds.id, bubble_runtime_validation_required=True
+        )
+
+    def test_sql_token_complexity_budget_boundary(self) -> None:
+        """The tokenizer accepts its exact token budget and rejects one more."""
+        at_budget = ",".join("x" for _ in range(_MAX_SQL_EXPRESSION_TOKENS // 2))
+        at_budget += ","
+        parsed = _tokenize_sql(at_budget)
+        assert parsed is not None
+        assert len(parsed.tokens) == _MAX_SQL_EXPRESSION_TOKENS
+        assert _tokenize_sql(f"{at_budget}x") is None
+
+    @pytest.mark.parametrize(
         ("expression", "expected_status"),
         [
             ("SUM(num)", "numeric"),
             ("AVG((num))", "numeric"),
+            ("AVG(CAST(num AS DECIMAL))", "numeric"),
             ("SUM(CAST(num AS DECIMAL(10, 2)))", "numeric"),
             ("AVG(TRY_CAST(num AS DOUBLE PRECISION))", "numeric"),
+            ("SUM(CAST(num AS INT8))", "numeric"),
+            ("AVG(TRY_CAST(num AS FLOAT8))", "numeric"),
             (
                 "SUM(CAST(COALESCE(num, '/* VARCHAR ) */ -- TEXT (') "
                 "AS DECIMAL(10, 2)))",
