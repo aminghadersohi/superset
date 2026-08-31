@@ -54,6 +54,11 @@ _NUMERIC_AGGREGATES = {
 _SIMPLE_IDENTIFIER = re.compile(r'^(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])$')
 _FUNCTION_PREFIX = re.compile(r"^([A-Za-z_][\w$]*)\s*\(")
 _NUMERIC_LITERAL = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+_SIMPLE_CAST_TYPE = re.compile(
+    r"^(?P<name>[A-Za-z_][\w$]*|DOUBLE\s+PRECISION)"
+    r"(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?$",
+    re.IGNORECASE,
+)
 _NONNUMERIC_SQL_TYPE = re.compile(
     r"\b(?:CHAR|VARCHAR|STRING|TEXT|BOOLEAN|BOOL|DATE|TIME|TIMESTAMP)\b",
     re.IGNORECASE,
@@ -142,6 +147,61 @@ def _parse_outer_function_call(sql: str) -> tuple[str, str] | None:
     return match.group(1).upper(), sql[opening + 1 : -1].strip()
 
 
+def _parse_cast_type(argument: str) -> str | None:  # noqa: C901
+    """Return an unambiguous, comment-free outer CAST target type."""
+    depth = 0
+    quote: str | None = None
+    as_positions: list[int] = []
+    index = 0
+    while index < len(argument):
+        char = argument[index]
+        if quote is not None:
+            if quote == "]":
+                if char == "]":
+                    quote = None
+            elif char == "\\":
+                index += 1
+            elif char == quote:
+                if index + 1 < len(argument) and argument[index + 1] == quote:
+                    index += 1
+                else:
+                    quote = None
+        elif char in {"'", '"', "`"}:
+            quote = char
+        elif char == "[":
+            quote = "]"
+        elif argument.startswith(("--", "/*"), index):
+            # Do not rewrite SQL before type inference. A commented CAST is
+            # intentionally left for runtime validation instead.
+            return None
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif (
+            depth == 0
+            and argument[index : index + 2].upper() == "AS"
+            and (index == 0 or not re.match(r"[\w$]", argument[index - 1]))
+            and (
+                index + 2 == len(argument)
+                or not re.match(r"[\w$]", argument[index + 2])
+            )
+        ):
+            as_positions.append(index)
+            index += 1
+        index += 1
+
+    if quote is not None or depth != 0 or len(as_positions) != 1:
+        return None
+    cast_type = argument[as_positions[0] + 2 :].strip()
+    type_match = _SIMPLE_CAST_TYPE.fullmatch(cast_type)
+    if type_match is None:
+        return None
+    return cast_type
+
+
 def _sql_expression_output_status(  # noqa: C901
     expression: str | None, dataset_context: Any
 ) -> BubbleMetricOutputStatus:
@@ -166,12 +226,9 @@ def _sql_expression_output_status(  # noqa: C901
     function, argument = function_call
 
     if function in {"CAST", "TRY_CAST"}:
-        cast_match = re.fullmatch(
-            r".+\s+AS\s+(.+)", argument, re.IGNORECASE | re.DOTALL
-        )
-        if cast_match is None:
+        cast_type = _parse_cast_type(argument)
+        if cast_type is None:
             return "unknown"
-        cast_type = cast_match.group(1).strip()
         if is_numeric_column({"type": cast_type}):
             return "numeric"
         if _NONNUMERIC_SQL_TYPE.search(cast_type):

@@ -404,6 +404,68 @@ class TestValidateAndCompileChartTypeCoverage:
         assert result.error_obj.error_code == "INVALID_BUBBLE_QUERY_DATA"
         assert "could not be verified" in result.error_obj.message
 
+    @pytest.mark.parametrize(
+        ("expression", "expected_error"),
+        [
+            ("CAST(MAX(name) AS VARCHAR /* INT */)", "INVALID_BUBBLE_QUERY_DATA"),
+            (
+                "CAST(MAX(name) AS BOOLEAN /* DECIMAL */)",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            (
+                "TRY_CAST(MAX(name) AS TEXT /* DOUBLE */)",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            (
+                "CAST(MAX(name) AS VARCHAR -- INT\n)",
+                "INVALID_BUBBLE_QUERY_DATA",
+            ),
+            ("CAST(MAX(name) AS VARCHAR INT)", "INVALID_BUBBLE_QUERY_DATA"),
+            ("CAST(MAX(name) AS VARCHAR)", "INVALID_BUBBLE_METRIC_OUTPUT"),
+            (
+                "CAST(COALESCE(MAX(name), '/* INT */ -- DECIMAL') AS TEXT)",
+                "INVALID_BUBBLE_METRIC_OUTPUT",
+            ),
+            ("CAST(MAX(num) AS INT)", None),
+            ("TRY_CAST(MAX(num) AS DOUBLE PRECISION)", None),
+            ("CAST((COALESCE(MAX(num), 0)) AS DECIMAL(10, 2))", None),
+        ],
+    )
+    @patch("superset.commands.chart.data.get_data_command.ChartDataCommand")
+    @patch("superset.common.query_context_factory.QueryContextFactory")
+    def test_empty_bubble_saved_metric_cast_inference_is_unambiguous(
+        self,
+        mock_factory: Mock,
+        mock_command: Mock,
+        expression: str,
+        expected_error: str | None,
+    ) -> None:
+        """Only simple, comment-free CAST targets provide static type proof."""
+        ds = _orm_dataset(metric_names=["cast_metric"])
+        ds.metrics[0].expression = expression
+        ds.metrics[0].metric_type = None
+        ds.metrics[0].d3format = None
+        config = BubbleChartConfig(
+            entity=ColumnRef(name="name"),
+            x=ColumnRef(name="cast_metric", saved_metric=True),
+            y=ColumnRef(name="num", aggregate="MAX"),
+            size=ColumnRef(name="num", aggregate="SUM"),
+        )
+        mock_factory.return_value.create.return_value = Mock()
+        mock_command.return_value.run.return_value = {"queries": [{"data": []}]}
+
+        result = validate_and_compile(
+            config,
+            map_bubble_config(config),
+            ds,
+            run_compile_check=True,
+        )
+
+        assert result.success is (expected_error is None)
+        if expected_error is not None:
+            assert result.error_obj is not None
+            assert result.error_obj.error_code == expected_error
+
     def test_pivot_table_bad_row_rejected(self):
         ds = _orm_dataset()
         config = PivotTableChartConfig(
