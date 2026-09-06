@@ -1505,6 +1505,18 @@ def _build_single_query_dict(  # noqa: C901
         series_limit_metric = form_data.get("timeseries_limit_metric")
     if series_limit_metric is not None:
         qd["series_limit_metric"] = series_limit_metric
+    # sort_by_metric charts (pie/funnel/treemap/sankey/gauge) order by the
+    # metric descending. buildQuery derives this on the frontend; the MCP path
+    # builds the query dict directly and never reads a top-level
+    # form_data['orderby'], so translate the flag here or a row_limit truncates
+    # an unordered result (dropping the heaviest rows rather than the top-N).
+    if (
+        form_data.get("viz_type")
+        in {"pie", "funnel", "treemap_v2", "sankey_v2", "gauge_chart"}
+        and form_data.get("sort_by_metric")
+        and metrics
+    ):
+        qd["orderby"] = [(metrics[0], False)]
     apply_form_data_filters_to_query(qd, form_data)
     # Mirror the common ``buildQueryObject``/``extractExtras`` translation used
     # by native frontend plugins. ``granularity_sqla`` is a form-data control,
