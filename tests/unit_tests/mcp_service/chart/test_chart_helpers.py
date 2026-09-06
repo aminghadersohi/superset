@@ -1269,3 +1269,20 @@ def test_shared_query_builder_preserves_pre_gantt_chart_contracts(
         build_query_dicts_from_form_data(dict(form_data), 1, "table")
         == expected_queries
     )
+
+
+def test_shared_query_builder_preserves_explicit_orderby() -> None:
+    """Keep explicit saved ordering through the shared preview/compile builder."""
+    form_data = {
+        "viz_type": "pie",
+        "groupby": ["region"],
+        "metrics": ["count"],
+        "orderby": [["count", True]],
+        "sort_by_metric": True,
+    }
+    with patch(
+        "superset.mcp_service.chart.chart_helpers.resolve_datasource_engine",
+        return_value="base",
+    ):
+        query = build_query_dicts_from_form_data(form_data, 1, "table")[0]
+    assert query["orderby"] == [["count", True]]

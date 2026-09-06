@@ -1425,7 +1425,9 @@ def test_temporal_dataset_semantics() -> None:
     assert plugin is not None
     config = _config()
     context = _dataset_context()
-    context.available_columns[0]["is_temporal"] = False
+    next(
+        column for column in context.available_columns if column["name"] == "Start_Time"
+    )["is_temporal"] = False
     with patch.object(DatasetValidator, "_get_dataset_context", return_value=context):
         error = plugin.post_map_validate(config, {}, dataset_id=1)
     assert error is not None
@@ -1470,32 +1472,27 @@ def test_unsaved_gantt_vega_preview_representative_empty_and_invalid_data() -> N
     ("bad_row", "message"),
     [
         (
-            {"start_time": None, "end_time": "2026-01-02", "task": "Build"},
-            "invalid temporal value for start_time",
-        ),
+            {"start_time": value, "end_time": "2026-01-02", "task": "Build"},
+            "invalid start",
+        )
+        for value in (None, True, "not-a-date", float("inf"))
+    ]
+    + [
         (
-            {"start_time": True, "end_time": "2026-01-02", "task": "Build"},
-            "invalid temporal value for start_time",
-        ),
+            {"start_time": "2026-01-01", "end_time": value, "task": "Build"},
+            "invalid end",
+        )
+        for value in (None, False, "not-a-date", float("nan"), "2025-01-01")
+    ]
+    + [
         (
-            {"start_time": "not-a-date", "end_time": "2026-01-02", "task": "Build"},
-            "invalid temporal value for start_time",
-        ),
-        (
-            {"start_time": "2026-01-03", "end_time": "2026-01-02", "task": "Build"},
-            "ends before it starts",
-        ),
-        (
-            {"start_time": "2026-01-01", "end_time": "2026-01-02", "task": None},
-            "invalid category value for task",
-        ),
-        (
-            {"start_time": "2026-01-01", "end_time": "2026-01-02", "task": True},
-            "invalid category value for task",
-        ),
+            {"start_time": "2026-01-01", "end_time": "2026-01-02", "task": value},
+            "invalid category",
+        )
+        for value in (None, True, "", "  ")
     ],
 )
-def test_gantt_preview_rejects_invalid_values_in_every_row(
+def test_gantt_preview_skips_invalid_values_in_mixed_results(
     bad_row: dict[str, object], message: str
 ) -> None:
     form_data = {
@@ -1510,10 +1507,12 @@ def test_gantt_preview_rejects_invalid_values_in_every_row(
         "task": "Plan",
     }
     result = _generate_gantt_vega_lite_preview([valid, bad_row], form_data)
-    assert isinstance(result, ChartError)
-    assert result.error_type == "InvalidGanttResult"
-    assert "row 1" in result.error
-    assert message in result.error
+    assert isinstance(result, VegaLitePreview), message
+    assert result.specification["data"]["values"] == [valid]
+    invalid = _generate_gantt_vega_lite_preview([bad_row], form_data)
+    assert isinstance(invalid, ChartError)
+    assert invalid.error_type == "InvalidGanttResult"
+    assert "no renderable intervals" in invalid.error
 
 
 def test_gantt_preview_resolves_custom_column_and_metric_aliases() -> None:
@@ -2369,6 +2368,12 @@ def test_gantt_update_preview_matches_would_be_persisted_state(
     }
     assert preview_state == persisted
 
+    previous_filters = existing["adhoc_filters"]
+    assert isinstance(previous_filters, list)
+    assert (previous_filters[0] in persisted["adhoc_filters"]) is (
+        "filters" not in overrides
+    )
+
     marker = persisted["_mcp_dashboard_time_filter_subject"]
     temporal_filters = [
         filter_
@@ -2416,3 +2421,83 @@ def test_registry_schema_validation_and_presentation_merge_wiring() -> None:
     assert replacement["legendMargin"] == 100
     assert replacement["zoomable"] is True
     assert replacement["x_axis_time_bounds"] == ["08:00:00", "19:00:00"]
+
+
+@pytest.mark.parametrize("field", ["start_time", "end_time", "y_axis", "series"])
+def test_gantt_preview_accepts_native_physical_column_objects(field: str) -> None:
+    form_data: dict[str, object] = {
+        "viz_type": "gantt_chart",
+        "start_time": "start",
+        "end_time": "end",
+        "y_axis": "task",
+        "series": "owner",
+        "tooltip_columns": [{"column_name": "project"}],
+    }
+    form_data[field] = {"column_name": form_data[field]}
+    row = {"start": 1, "end": 2, "task": "Build", "owner": "Amin", "project": "MCP"}
+    preview = _generate_gantt_vega_lite_preview([row], form_data)
+    assert isinstance(preview, VegaLitePreview)
+    assert preview.specification["data"]["values"] == [row]
+
+
+def test_gantt_preview_bounds_renderable_rows_and_projects_used_fields() -> None:
+    form_data = {
+        "start_time": "start",
+        "end_time": "end",
+        "y_axis": "task",
+    }
+    invalid = {"start": None, "end": 2, "task": "Open"}
+    valid = {"start": 1, "end": 2, "task": "Build", "unused": "large payload"}
+    preview = _generate_gantt_vega_lite_preview(
+        [invalid] * 1001 + [valid] * 1001, form_data
+    )
+    assert isinstance(preview, VegaLitePreview)
+    assert (
+        preview.specification["data"]["values"]
+        == [{"start": 1, "end": 2, "task": "Build"}] * 1000
+    )
+
+
+def test_gantt_saved_update_replaces_marked_binding_and_preserves_native_filters() -> (
+    None
+):
+    """A changed temporal subject must not discard unrelated saved predicates."""
+    existing = {
+        "viz_type": "gantt_chart",
+        "_mcp_dashboard_time_filter_subject": "start_time",
+        "adhoc_filters": [
+            {
+                "expressionType": "SIMPLE",
+                "clause": "WHERE",
+                "subject": "start_time",
+                "operator": "TEMPORAL_RANGE",
+                "comparator": "Last 30 days",
+            },
+            {
+                "expressionType": "SIMPLE",
+                "clause": "WHERE",
+                "subject": "owner",
+                "operator": "==",
+                "comparator": "Amin",
+            },
+        ],
+    }
+    config = _config(temporal_column="end_time", time_range="Last 7 days")
+    chart = SimpleNamespace(
+        id=1,
+        datasource_id=None,
+        slice_name="Gantt",
+        params=__import__("json").dumps(existing),
+    )
+    request = UpdateChartRequest(identifier=1, config=config)
+    payload = _build_update_payload(request, chart, parsed_config=config)
+    assert isinstance(payload, dict)
+    saved = __import__("json").loads(payload["params"])
+    assert existing["adhoc_filters"][1] in saved["adhoc_filters"]
+    temporal = [
+        item for item in saved["adhoc_filters"] if item["operator"] == "TEMPORAL_RANGE"
+    ]
+    assert len(temporal) == 1
+    assert temporal[0]["subject"] == "end_time"
+    assert temporal[0]["comparator"] == "Last 7 days"
+    GanttChartConfig.model_validate(saved)

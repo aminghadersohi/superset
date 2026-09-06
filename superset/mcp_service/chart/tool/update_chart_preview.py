@@ -38,10 +38,10 @@ from superset.mcp_service.chart.chart_utils import (
     generate_chart_name,
     generate_explore_link,
     map_config_to_form_data,
-    MCP_DASHBOARD_TIME_FILTER_SUBJECT,
     merge_gantt_ui_config,
     merge_interactive_pivot_ui_config,
     merge_table_column_config,
+    preserve_previous_adhoc_filters as _preserve_previous_adhoc_filters,
     validate_gantt_form_data,
 )
 from superset.mcp_service.chart.compile import validate_and_compile
@@ -108,54 +108,6 @@ def _get_previous_form_data(form_data_key: str) -> dict[str, Any] | None:
     except (KeyError, ValueError, TypeError, CommandException):
         logger.debug("Could not retrieve previous form_data from cache")
     return None
-
-
-def _preserve_previous_adhoc_filters(
-    new_form_data: dict[str, Any], previous_form_data: dict[str, Any]
-) -> None:
-    """Preserve cached filters without dropping mapper-generated bindings."""
-    previous_filters = previous_form_data.get("adhoc_filters")
-    if not isinstance(previous_filters, list) or not previous_filters:
-        return
-
-    generated_filters = new_form_data.get("adhoc_filters", [])
-    previous_binding = previous_form_data.get(MCP_DASHBOARD_TIME_FILTER_SUBJECT)
-    # The marker identifies the mapper-owned temporal subject. Its comparator
-    # may be an active time range, so remove the prior binding regardless of
-    # comparator before adding the binding generated from the typed state.
-    merged_filters = [
-        filter_
-        for filter_ in previous_filters
-        if not (
-            previous_binding
-            and isinstance(filter_, dict)
-            and filter_.get("operator") == "TEMPORAL_RANGE"
-            and filter_.get("subject") == previous_binding
-        )
-    ]
-    for generated_filter in generated_filters:
-        if not isinstance(generated_filter, dict):
-            if generated_filter not in merged_filters:
-                merged_filters.append(generated_filter)
-            continue
-
-        # Replace an equivalent cached filter rather than deduplicating it: an
-        # unchanged temporal subject can still have a newly supplied comparator.
-        merged_filters = [
-            previous_filter
-            for previous_filter in merged_filters
-            if not (
-                isinstance(previous_filter, dict)
-                and previous_filter.get("clause") == generated_filter.get("clause")
-                and previous_filter.get("expressionType")
-                == generated_filter.get("expressionType")
-                and previous_filter.get("subject") == generated_filter.get("subject")
-                and previous_filter.get("operator") == generated_filter.get("operator")
-            )
-        ]
-        merged_filters.append(generated_filter)
-
-    new_form_data["adhoc_filters"] = merged_filters
 
 
 @tool(
@@ -267,7 +219,11 @@ def update_chart_preview(  # noqa: C901
             merged_gantt_config = validate_gantt_form_data(
                 new_form_data,
                 request.dataset_id,
-                dataset_context=build_dataset_context_from_orm(dataset),
+                dataset_context=(
+                    build_dataset_context_from_orm(dataset)
+                    if new_form_data.get("viz_type") == "gantt_chart"
+                    else None
+                ),
             )
             if merged_gantt_config is not None:
                 # Compile the final cached state rather than the pre-merge

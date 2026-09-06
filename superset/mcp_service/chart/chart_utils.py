@@ -663,6 +663,64 @@ def validate_gantt_form_data(
     )
 
 
+def preserve_previous_adhoc_filters(
+    new_form_data: dict[str, Any], previous_form_data: dict[str, Any]
+) -> None:
+    """Merge non-generated prior filters, replacing the marked temporal binding."""
+    previous_filters = previous_form_data.get("adhoc_filters")
+    if not isinstance(previous_filters, list) or not previous_filters:
+        return
+
+    generated_filters = new_form_data.get("adhoc_filters", [])
+    previous_binding = previous_form_data.get(MCP_DASHBOARD_TIME_FILTER_SUBJECT)
+    # The marker identifies the mapper-owned temporal subject. Its comparator
+    # may be an active time range, so remove the prior binding regardless of
+    # comparator before adding the binding generated from the typed state.
+    # Native Gantt may also carry an unmarked "No filter" placeholder. It has
+    # no predicate to preserve; the new marked binding replaces that placeholder.
+    merged_filters = [
+        filter_
+        for filter_ in previous_filters
+        if not (
+            isinstance(filter_, dict)
+            and filter_.get("operator") == "TEMPORAL_RANGE"
+            and (
+                (previous_binding and filter_.get("subject") == previous_binding)
+                or (
+                    new_form_data.get("viz_type") == "gantt_chart"
+                    and new_form_data.get(MCP_DASHBOARD_TIME_FILTER_SUBJECT)
+                    and filter_.get("comparator") == "No filter"
+                    and filter_.get("expressionType") == "SIMPLE"
+                    and filter_.get("clause") == "WHERE"
+                )
+            )
+        )
+    ]
+    for generated_filter in generated_filters:
+        if not isinstance(generated_filter, dict):
+            if generated_filter not in merged_filters:
+                merged_filters.append(generated_filter)
+            continue
+
+        # Replace an equivalent cached filter rather than deduplicating it: an
+        # unchanged temporal subject can still have a newly supplied comparator.
+        merged_filters = [
+            previous_filter
+            for previous_filter in merged_filters
+            if not (
+                isinstance(previous_filter, dict)
+                and previous_filter.get("clause") == generated_filter.get("clause")
+                and previous_filter.get("expressionType")
+                == generated_filter.get("expressionType")
+                and previous_filter.get("subject") == generated_filter.get("subject")
+                and previous_filter.get("operator") == generated_filter.get("operator")
+            )
+        ]
+        merged_filters.append(generated_filter)
+
+    new_form_data["adhoc_filters"] = merged_filters
+
+
 def merge_gantt_ui_config(
     previous_form_data: Mapping[str, Any], new_form_data: Dict[str, Any]
 ) -> GanttChartConfig | None:

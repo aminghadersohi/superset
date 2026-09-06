@@ -43,6 +43,7 @@ from superset.mcp_service.chart.chart_utils import (
     merge_gantt_ui_config,
     merge_interactive_pivot_ui_config,
     merge_table_column_config,
+    preserve_previous_adhoc_filters,
     validate_gantt_form_data,
 )
 from superset.mcp_service.chart.compile import validate_and_compile
@@ -217,6 +218,21 @@ def _merge_replacement_config(
     return merged
 
 
+def _merge_gantt_update_state(
+    existing_form_data: dict[str, Any],
+    new_form_data: dict[str, Any],
+    parsed_config: Any,
+) -> None:
+    """Preserve Gantt presentation and omitted filters in saved and preview state."""
+    merge_gantt_ui_config(existing_form_data, new_form_data)
+    if (
+        existing_form_data.get("viz_type") == "gantt_chart"
+        and new_form_data.get("viz_type") == "gantt_chart"
+        and getattr(parsed_config, "filters", None) is None
+    ):
+        preserve_previous_adhoc_filters(new_form_data, existing_form_data)
+
+
 def _build_update_payload(
     request: UpdateChartRequest,
     chart: Any,
@@ -242,7 +258,7 @@ def _build_update_payload(
         existing_form_data = _get_existing_form_data(chart)
         merge_table_column_config(existing_form_data, new_form_data)
         merge_interactive_pivot_ui_config(existing_form_data, new_form_data)
-        merge_gantt_ui_config(existing_form_data, new_form_data)
+        _merge_gantt_update_state(existing_form_data, new_form_data, parsed_config)
 
         chart_name = (
             request.chart_name
@@ -325,10 +341,10 @@ def _build_preview_form_data(
         new_form_data.pop("_mcp_warnings", None)
         merge_table_column_config(existing_form_data, new_form_data)
         merge_interactive_pivot_ui_config(existing_form_data, new_form_data)
-        merge_gantt_ui_config(existing_form_data, new_form_data)
+        _merge_gantt_update_state(existing_form_data, new_form_data, parsed_config)
         if new_form_data.get("viz_type") == "gantt_chart":
             # The persisted Gantt payload is the mapped replacement plus the
-            # presentation controls merged above. Build the preview from that
+            # presentation controls and omitted filters. Build the preview from that
             # same state so generated temporal bindings, explicit empty filters,
             # and marker provenance cannot diverge before Save.
             merged = dict(new_form_data)

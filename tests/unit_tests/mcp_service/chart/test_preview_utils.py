@@ -232,6 +232,10 @@ def test_unsaved_big_number_preview_uses_temporal_query_contract():
         ],
     }
     with (
+        patch(
+            "superset.mcp_service.chart.chart_helpers.resolve_datasource_engine",
+            return_value="base",
+        ),
         patch("superset.extensions.db.session.get", return_value=object()),
         patch(
             "superset.commands.chart.data.get_data_command.ChartDataCommand"

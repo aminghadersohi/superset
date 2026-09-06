@@ -496,7 +496,7 @@ def _gantt_result_field(field: Any, _field_name: str) -> str | None:
         return field
     if not isinstance(field, dict) or not 0 < len(field) <= 20:
         return None
-    label = field.get("label") or field.get("sqlExpression")
+    label = field.get("label") or field.get("sqlExpression") or field.get("column_name")
     return label if isinstance(label, str) and label else None
 
 
@@ -549,7 +549,7 @@ def _is_valid_gantt_category(value: Any) -> bool:
 def _generate_gantt_vega_lite_preview(  # noqa: C901
     data: Any, form_data: Dict[str, Any]
 ) -> VegaLitePreview | ChartError:
-    """Validate all Gantt rows and build the shared interval-bar preview."""
+    """Build a bounded preview from renderable intervals, checking result shape."""
     if not isinstance(data, list):
         return ChartError(
             error="Gantt result data is not an array of rows.",
@@ -629,6 +629,7 @@ def _generate_gantt_vega_lite_preview(  # noqa: C901
     required = {start, end, category, *tooltip_columns, *tooltip_metrics}
     if series:
         required.add(series)
+    renderable_rows: list[dict[str, Any]] = []
     for index, row in enumerate(data):
         if not isinstance(row, dict):
             return ChartError(
@@ -645,38 +646,23 @@ def _generate_gantt_vega_lite_preview(  # noqa: C901
                 error_type="InvalidGanttResult",
             )
         start_value = _gantt_temporal_value(row[start])
-        if start_value is None:
-            return ChartError(
-                error=(
-                    f"Gantt result row {index} has an invalid temporal value for "
-                    f"{start}."
-                ),
-                error_type="InvalidGanttResult",
-            )
         end_value = _gantt_temporal_value(row[end])
-        if end_value is None:
-            return ChartError(
-                error=(
-                    f"Gantt result row {index} has an invalid temporal value for {end}."
-                ),
-                error_type="InvalidGanttResult",
-            )
-        if end_value < start_value:
-            return ChartError(
-                error=(
-                    f"Gantt result row {index} ends before it starts: "
-                    f"{end} is earlier than {start}."
-                ),
-                error_type="InvalidGanttResult",
-            )
-        if not _is_valid_gantt_category(row[category]):
-            return ChartError(
-                error=(
-                    f"Gantt result row {index} has an invalid category value for "
-                    f"{category}."
-                ),
-                error_type="InvalidGanttResult",
-            )
+        if (
+            start_value is None
+            or end_value is None
+            or end_value < start_value
+            or not _is_valid_gantt_category(row[category])
+        ):
+            continue
+        # Limit the LLM-facing payload and omit fields unused by the preview.
+        if len(renderable_rows) < 1000:
+            renderable_rows.append({field: row[field] for field in sorted(required)})
+
+    if data and not renderable_rows:
+        return ChartError(
+            error="Gantt result contains no renderable intervals.",
+            error_type="InvalidGanttResult",
+        )
 
     tooltip_fields: list[dict[str, str]] = [
         {"field": category, "type": "nominal"},
@@ -714,7 +700,7 @@ def _generate_gantt_vega_lite_preview(  # noqa: C901
     return VegaLitePreview(
         specification={
             "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-            "data": {"values": data},
+            "data": {"values": renderable_rows},
             "mark": {"type": "bar", "tooltip": True},
             "encoding": encoding,
             "width": "container",

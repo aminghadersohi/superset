@@ -615,6 +615,8 @@ def _build_single_query_dict(
 ) -> dict[str, Any]:
     """Build one query entry for QueryContextFactory from form_data fields."""
     qd: dict[str, Any] = {"columns": columns, "metrics": metrics}
+    if form_data.get("orderby"):
+        qd["orderby"] = form_data["orderby"]
     effective_row_limit = row_limit
     if effective_row_limit is None:
         effective_row_limit = form_data.get("row_limit")
@@ -623,11 +625,10 @@ def _build_single_query_dict(
     if order_desc is not None:
         qd["order_desc"] = order_desc
     # sort_by_metric charts (pie/funnel/treemap/sankey/gauge) order by the
-    # metric descending. buildQuery derives this on the frontend; the MCP path
-    # builds the query dict directly and never reads a top-level
-    # form_data['orderby'], so translate the flag here or a row_limit truncates
+    # metric descending. buildQuery derives this on the frontend; translate
+    # the flag here when there is no explicit ordering or a row_limit truncates
     # an unordered result (dropping the heaviest rows rather than the top-N).
-    if form_data.get("sort_by_metric") and metrics:
+    if form_data.get("sort_by_metric") and metrics and not qd.get("orderby"):
         qd["orderby"] = [(metrics[0], False)]
     apply_form_data_filters_to_query(qd, form_data)
     return qd
