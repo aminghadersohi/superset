@@ -2926,6 +2926,12 @@ SQLA_TABLE_MUTATOR = lambda table: table  # noqa: E731
 # queries run on the Global Task Framework (one task per QueryObject) over
 # DISTRIBUTED_COORDINATION_CONFIG; the client polls /api/v1/task/status_changes at
 # this interval (milliseconds) and re-issues its request once the tasks succeed.
+# Operator-supplied QueryManager subclass (class or dotted import path).
+# None selects the built-in GTF implementation.
+ASYNC_QUERY_MANAGER_CLASS: type | str | None = None
+# Deprecated alias, honored only when ASYNC_QUERY_MANAGER_CLASS is unset.
+GLOBAL_ASYNC_QUERY_MANAGER_CLASS: type | str | None = None
+
 GLOBAL_ASYNC_QUERIES_POLLING_DELAY = int(
     timedelta(milliseconds=500).total_seconds() * 1000
 )

@@ -64,7 +64,7 @@ const TERMINAL_STATUSES = new Set([
 ]);
 
 type TaskStatusChange = { status: string; progress: number | null };
-type StatusChangesResponse = {
+export type StatusChangesResponse = {
   statuses: Record<string, TaskStatusChange>;
   cursor: string | null;
 };
@@ -172,13 +172,24 @@ const stopIfStale = (generation: number): boolean => {
 // that reaches this browser is always its own.
 const TASK_STATUS_TOPIC = 'task.status';
 
-const fetchStatusChanges = makeApi<
-  { cursor?: string | null; task_type: string },
+export type StatusChangesRequest = {
+  cursor?: string | null;
+  task_type: string;
+};
+
+export type AsyncQueryPollingTransport = (
+  request: StatusChangesRequest,
+) => Promise<StatusChangesResponse>;
+
+const defaultFetchStatusChanges = makeApi<
+  StatusChangesRequest,
   StatusChangesResponse
 >({
   method: 'GET',
   endpoint: STATUS_CHANGES_URL,
 });
+
+let fetchStatusChanges: AsyncQueryPollingTransport = defaultFetchStatusChanges;
 
 const cancelTask = (taskId: string, tabId: string) => {
   // Best-effort task abort/unsubscribe. This prevents pending work from starting
@@ -587,7 +598,11 @@ export const waitForAsyncData = async <T = unknown[]>(
   return refetch(taskIds);
 };
 
-export const init = (appConfig?: AppConfig) => {
+export const init = (
+  appConfig?: AppConfig,
+  pollingTransport: AsyncQueryPollingTransport = defaultFetchStatusChanges,
+) => {
+  fetchStatusChanges = pollingTransport;
   pollingGeneration += 1;
   if (pollingTimeoutId) clearTimeout(pollingTimeoutId);
 

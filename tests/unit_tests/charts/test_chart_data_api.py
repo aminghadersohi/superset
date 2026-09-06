@@ -824,7 +824,7 @@ def test_run_async_does_not_project_timing_onto_a_job_response(
         with (
             app.test_request_context("/api/v1/chart/data", method="POST"),
             patch(
-                "superset.charts.data.api.submit_chart_data_query_tasks",
+                "superset.tasks.async_queries.submit_chart_data_query_tasks",
                 return_value={
                     "task_ids": ["task-1", "task-2"],
                     "cursor": "2020-01-01T00:00:00",

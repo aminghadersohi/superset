@@ -54,8 +54,8 @@ from superset.constants import CACHE_DISABLED_TIMEOUT
 from superset.daos.exceptions import DatasourceNotFound
 from superset.exceptions import QueryObjectValidationError, SupersetSecurityException
 from superset.extensions import cache_manager, event_logger
+from superset.extensions.query_manager import get_query_manager
 from superset.models.sql_lab import Query
-from superset.tasks.async_queries import submit_chart_data_query_tasks
 from superset.tasks.guest import get_current_guest_subscriber_key
 from superset.utils import json
 from superset.utils.core import (
@@ -429,7 +429,7 @@ class ChartDataRestApi(ChartRestApi):
         # chart query. The client polls /api/v1/task/status_changes, aggregates the
         # tasks' statuses, and on success re-issues this same request — now served
         # synchronously from the per-query DATA cache the tasks populated.
-        job = submit_chart_data_query_tasks(command.query_context, get_user_id())
+        job = get_query_manager().submit(command.query_context, get_user_id())
         return self.response(202, **job)
 
     def _send_chart_response(  # noqa: C901

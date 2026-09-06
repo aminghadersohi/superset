@@ -1040,6 +1040,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         self.configure_ssh_manager()
         self.configure_stats_manager()
         self.configure_task_manager()
+        self.configure_async_queries()
         self.configure_websocket()
 
         # Hook that provides administrators a handle on the Flask APP
@@ -1621,6 +1622,12 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
             from superset.tasks.manager import TaskManager
 
             TaskManager.init_app(self.superset_app)
+
+    def configure_async_queries(self) -> None:
+        """Initialize the app-local GTF query manager, including downstream hooks."""
+        from superset.extensions.query_manager import query_manager_factory
+
+        query_manager_factory.init_app(self.superset_app)
 
     def configure_websocket(self) -> None:
         """Mint the websocket channel-token cookie when the transport is enabled."""

@@ -835,3 +835,42 @@ test('WS mode: the last-chance catch-up before give-up recovers a missed complet
   expect(refetch).toHaveBeenCalledTimes(1);
   jest.useRealTimers();
 });
+
+test.each([false, true])(
+  'uses a custom status transport for polling and websocket catch-up (ws=%s)',
+  async websocket => {
+    const transport = jest.fn().mockResolvedValue({
+      statuses: { 'task-1': { status: 'success', progress: null } },
+      cursor: '2026-01-01T00:00:01',
+    });
+    asyncEvent.init(
+      {
+        ...config,
+        WEBSOCKET_ENABLE: websocket,
+        WEBSOCKET_URL: 'ws://localhost:8080/',
+      },
+      transport,
+    );
+    const refetch = jest.fn().mockResolvedValue([{ rows: 1 }]);
+    await asyncEvent.waitForAsyncData(
+      { task_ids: ['task-1'], cursor: '2026-01-01T00:00:00' },
+      refetch,
+    );
+    expect(transport).toHaveBeenCalledWith({
+      cursor: '2026-01-01T00:00:00',
+      task_type: 'superset.query_object_v1',
+    });
+    expect(refetch).toHaveBeenCalledTimes(1);
+    expect(fetchMock.callHistory.calls(STATUS_CHANGES_ENDPOINT)).toHaveLength(
+      0,
+    );
+
+    // Reinitializing without a custom transport restores the built-in reader.
+    queueStatuses({ 'task-2': { status: 'success' } });
+    asyncEvent.init(config);
+    await asyncEvent.waitForAsyncData({ task_ids: ['task-2'] }, refetch);
+    expect(
+      fetchMock.callHistory.calls(STATUS_CHANGES_ENDPOINT).length,
+    ).toBeGreaterThan(0);
+  },
+);

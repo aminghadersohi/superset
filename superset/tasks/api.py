@@ -272,8 +272,9 @@ class TaskRestApi(BaseSupersetModelRestApi):
     @safe
     @statsd_metrics
     @event_logger.log_this_with_context(
-        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}"
-        ".status_changes",
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.status_changes"
+        ),
         log_to_statsd=False,
     )
     def status_changes(self) -> Response:
@@ -318,7 +319,7 @@ class TaskRestApi(BaseSupersetModelRestApi):
             401:
               $ref: '#/components/responses/401'
         """
-        from superset.daos.tasks import TaskDAO
+        from superset.extensions.query_manager import get_query_manager
 
         cursor: datetime | None = None
         if cursor_arg := request.args.get("cursor"):
@@ -327,7 +328,7 @@ class TaskRestApi(BaseSupersetModelRestApi):
             except ValueError:
                 return self.response_400(message="Invalid cursor")
 
-        statuses, next_cursor = TaskDAO.get_statuses_changed_since(
+        statuses, next_cursor = get_query_manager().status_changes(
             cursor, task_type=request.args.get("task_type")
         )
         return self.response(

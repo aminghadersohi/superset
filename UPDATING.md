@@ -34,9 +34,9 @@ transport below) and re-issuing the original `/chart/data` request against the
 now-warm per-query cache, and the realtime WebSocket server is a generic,
 feature-agnostic task push transport rather than a GAQ-specific event tail.
 
-Breaking removals (no deprecation window):
+Breaking protocol removals (Python import adapters are described below):
 
-- The `/api/v1/async_event/` REST API, `AsyncQueryManager`, and the
+- The `/api/v1/async_event/` REST API and the
   `qc-<hash>` query-context descriptor replay endpoint
   (`GET /api/v1/chart/data/<cache_key>`) are removed. Any client that consumed a
   `result_url` from a `202` response must move to the re-request model (the
@@ -47,9 +47,35 @@ Breaking removals (no deprecation window):
   `GLOBAL_ASYNC_QUERIES_REDIS_STREAM_LIMIT`,
   `GLOBAL_ASYNC_QUERIES_REDIS_STREAM_LIMIT_FIREHOSE`,
   `GLOBAL_ASYNC_QUERIES_REGISTER_REQUEST_HANDLERS`,
-  `GLOBAL_ASYNC_QUERIES_JWT_*`, and
-  `GLOBAL_ASYNC_QUERY_MANAGER_CLASS`. The coordinator (locks, GTF, and now GAQ)
+  `GLOBAL_ASYNC_QUERIES_JWT_*`. The coordinator (locks, GTF, and now GAQ)
   uses `DISTRIBUTED_COORDINATION_CONFIG` exclusively.
+
+Downstream extension migration:
+
+- `ASYNC_QUERY_MANAGER_CLASS` selects an app-local
+  `superset.tasks.query_manager.QueryManager` subclass (class or dotted path).
+  Chart submission and `/api/v1/task/status_changes` use this manager; the
+  default implementation delegates to GTF. Frontend forks can supply a polling
+  reader to `asyncEvent.init(config, pollingTransport)` without replacing the
+  GTF waiter, cancellation, or cache re-request logic.
+- `superset.extensions.async_query_manager_factory`, `async_query_manager`,
+  `superset.async_events.async_query_manager.AsyncQueryManager`,
+  `AsyncQueryTokenException`, and `CreateAsyncChartDataJobCommand` are deprecated
+  import adapters. `GLOBAL_ASYNC_QUERY_MANAGER_CLASS` is a deprecated fallback
+  for the new setting. Use emits `DeprecationWarning`; these adapters and the
+  config alias will be retained throughout the first major release containing
+  this change, with removal no earlier than the following major release.
+- This is **import compatibility, not legacy job-protocol compatibility**.
+  Submission returns GTF `task_ids`/`cursor`, not `job_id`/`result_url`.
+  `init_job`, `update_job`, `read_events`, the old cookie/Redis settings, and
+  legacy Explore Celery tasks are not restored. Existing subclasses must migrate
+  those overrides; importing successfully does not make them runtime-compatible.
+- Verified Manager-JWT `jti` channel IDs can still be returned by an overridden
+  `parse_channel_id_from_request` for custom transports. They do not replace GTF
+  subscriber authorization or its principal-prefixed websocket routing keys.
+
+See [Async-query extension migration](docs/developer_docs/extensions/async-queries.md)
+for the supported contract and the complete configuration disposition.
 
 Enabling async chart data in the new flow:
 

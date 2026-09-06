@@ -199,3 +199,25 @@ security_manager: SupersetSecurityManager = LocalProxy(lambda: appbuilder.sm)
 ssh_manager_factory = SSHManagerFactory()
 stats_logger_manager = BaseStatsLoggerManager()
 talisman = Talisman()
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve deprecated GAQ extension imports without initializing an app."""
+    if name in {"async_query_manager_factory", "async_query_manager"}:
+        import warnings
+
+        from superset.extensions.query_manager import (
+            get_query_manager,
+            query_manager_factory,
+        )
+
+        warnings.warn(
+            f"superset.extensions.{name} is deprecated; use "
+            "superset.extensions.query_manager.get_query_manager instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if name == "async_query_manager_factory":
+            return query_manager_factory
+        return LocalProxy(get_query_manager)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
