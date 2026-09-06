@@ -1574,6 +1574,9 @@ def build_query_objects_from_form_data(  # noqa: C901
         query["post_processing"] = _pie_contribution_post_processing(
             list(query.get("metrics") or [])
         )
+    elif effective_viz in {"funnel", "treemap_v2", "sankey_v2", "gauge_chart"}:
+        if form_data.get("sort_by_metric") and form_data.get("metric") is not None:
+            query["orderby"] = [(form_data["metric"], False)]
     elif effective_viz == "sunburst_v2":
         if not form_data.get("sort_by_metric"):
             query["orderby"] = []
