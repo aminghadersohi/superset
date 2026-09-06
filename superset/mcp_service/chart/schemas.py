@@ -3029,11 +3029,13 @@ def _same_metric_query_reference(left: ColumnRef, right: ColumnRef) -> bool:
         )
     if left.saved_metric or right.saved_metric:
         return left.saved_metric and right.saved_metric and left.name == right.name
+    aggregate_aliases = {"STDDEV": "STDDEV_SAMP", "VAR": "VAR_SAMP"}
     return (
         left.aggregate is not None
         and right.aggregate is not None
         and left.name == right.name
-        and left.aggregate == right.aggregate
+        and aggregate_aliases.get(left.aggregate, left.aggregate)
+        == aggregate_aliases.get(right.aggregate, right.aggregate)
     )
 
 

@@ -306,7 +306,6 @@ def test_extract_sql_enforces_query_count_and_aggregate_source_bytes(
 ) -> None:
     test_limit = 4 * 1024
     monkeypatch.setattr(_get_chart_sql_mod, "MAX_QUERY_RESULT_VALUE_BYTES", test_limit)
-    monkeypatch.setattr(_query_result_mod, "MAX_QUERY_RESULT_VALUE_BYTES", test_limit)
     too_many = _extract_sql_from_result(
         {"queries": [{} for _ in range(MAX_QUERY_RESULTS + 1)]},
         1,

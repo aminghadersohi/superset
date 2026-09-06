@@ -694,7 +694,7 @@ class StringSubclass(str):
         {"cached_dttm": StringSubclass("2026-09-02T00:00:00+00:00")},
         {"queried_dttm": -1},
         {"queried_dttm": "2026-09-02T00:00:00"},
-        {"cache_timeout": -1},
+        {"cache_timeout": -2},
         {"cache_timeout": 2**31},
         {"cache_timeout": IntSubclass(1)},
         {"cache_key": StringSubclass("key")},
@@ -1639,3 +1639,23 @@ def test_max_query_count_cannot_multiply_the_shared_nested_budget(monkeypatch) -
 
     assert error is not None
     assert "aggregate values" in error.error
+
+
+@pytest.mark.parametrize("timeout", [-1, 0, 300, 2**31 - 1, None])
+def test_producer_cache_timeout_preserves_disabled_and_bounded_values(
+    timeout: int | None,
+) -> None:
+    """The real command envelope accepts disabled caching without rewriting it."""
+    result = _producer_result({"data": [{"value": 1}], "cache_timeout": timeout})
+    assert validate_query_result_envelope(result) is None
+    assert result["queries"][0]["cache_timeout"] == timeout
+
+
+@pytest.mark.parametrize("timeout", [-2, True, False, -1.0, "-1", IntSubclass(-1)])
+def test_cache_timeout_rejects_noncanonical_sentinel_lookalikes(timeout: Any) -> None:
+    """Only the exact integer sentinel bypasses the non-negative timeout range."""
+    error = validate_query_result_envelope(
+        {"queries": [{"data": [], "cache_timeout": timeout}]}
+    )
+    assert error is not None
+    assert error.error_type == "InvalidQueryResult"

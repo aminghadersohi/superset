@@ -65,6 +65,7 @@ from superset.mcp_service.chart.schemas import (
     ChartConfig,
     ChartError,
     ColumnRef,
+    GaugeChartConfig,
     GenerateChartRequest,
     GenerateExploreLinkRequest,
     GetChartDataRequest,
@@ -371,6 +372,7 @@ def _registered_query_role_matrix() -> list[ChartConfig]:
         for query_mode in ("raw", "aggregate")
     ] + [
         PieChartConfig(dimension=ColumnRef(name="region"), metric=metric),
+        GaugeChartConfig(metric=metric, groupby=[ColumnRef(name="region")]),
         *[
             XYChartConfig(
                 kind=kind,
@@ -2734,15 +2736,21 @@ def test_compile_path_uses_chart_faithful_query() -> None:
         ({"sql_expression": "SUM(sales)", "label": "SQL Sales"}, "SQL Sales"),
     ],
 )
+@pytest.mark.parametrize("value", [Decimal("4.50"), None, float("nan")])
+@pytest.mark.parametrize("cache_timeout", [-1, 0, 300])
 def test_compile_proves_numeric_metric_by_resolved_alias(
-    metric: dict[str, object], result_label: str
+    metric: dict[str, object],
+    result_label: str,
+    value: Decimal | float | None,
+    cache_timeout: int,
 ) -> None:
     form_data = map_config_to_form_data(_config(metric=metric))
     factory = MagicMock()
     factory.create.return_value = object()
     command = MagicMock()
     command.run.return_value = chart_data_command_result(
-        [{"region": "A", "country": "B", result_label: Decimal("4.50")}],
+        [{"region": "A", "country": "B", result_label: value}],
+        cache_timeout=cache_timeout,
         columns=["region", "country", result_label],
         coltypes=[
             GenericDataType.STRING,
@@ -2834,10 +2842,6 @@ def test_compile_accepts_finite_decimal_boundaries(value: Decimal) -> None:
         ([{"region": "A", "country": "B"}], "INVALID_SUNBURST_RESULT"),
         (
             [{"region": "A", "country": "B", "Sales": "12.50"}],
-            "INVALID_SUNBURST_RESULT",
-        ),
-        (
-            [{"region": "A", "country": "B", "Sales": float("nan")}],
             "INVALID_SUNBURST_RESULT",
         ),
         (
@@ -4809,7 +4813,11 @@ def test_unsaved_preview_validates_query_envelopes_and_all_rows() -> None:
     assert "warehouse timeout" in failure.error
 
 
-def test_saved_preview_is_sunburst_faithful_and_vega_is_unsupported() -> None:
+@pytest.mark.parametrize("value", [10, None])
+@pytest.mark.parametrize("cache_timeout", [-1, 0, 300])
+def test_saved_preview_is_sunburst_faithful_and_vega_is_unsupported(
+    value: int | None, cache_timeout: int
+) -> None:
     form_data = map_config_to_form_data(
         _config(metric={"sql_expression": "SUM(sales)", "label": "SQL Sales"})
     )
@@ -4825,19 +4833,15 @@ def test_saved_preview_is_sunburst_faithful_and_vega_is_unsupported() -> None:
         identifier=11, format="ascii", ascii_width=111, ascii_height=33
     )
     command = MagicMock()
-    command.run.return_value = {
-        "queries": [
-            {
-                "data": [
-                    {
-                        "region": "Americas",
-                        "country": "Brazil",
-                        "SQL Sales": 10,
-                    }
-                ]
-            }
-        ]
-    }
+    command.run.return_value = chart_data_command_result(
+        [{"region": "Americas", "country": "Brazil", "SQL Sales": value}],
+        coltypes=[
+            GenericDataType.STRING,
+            GenericDataType.STRING,
+            GenericDataType.NUMERIC,
+        ],
+        cache_timeout=cache_timeout,
+    )
     with (
         patch(
             "superset.mcp_service.chart.tool.get_chart_preview."
@@ -4853,7 +4857,7 @@ def test_saved_preview_is_sunburst_faithful_and_vega_is_unsupported() -> None:
 
     assert not isinstance(ascii_result, ChartError)
     assert "Americas > Brazil" in ascii_result.ascii_content
-    assert "SQL Sales=10" in ascii_result.ascii_content
+    assert f"SQL Sales={value or 0}" in ascii_result.ascii_content
     assert (ascii_result.width, ascii_result.height) == (111, 33)
 
     vega_result = VegaLitePreviewStrategy(
@@ -5276,3 +5280,52 @@ async def test_cross_viz_preview_update_and_immediate_save_report_sunburst_state
     assert saved.chart is not None
     assert saved.chart.viz_type == "sunburst_v2"
     assert saved.form_data["viz_type"] == "sunburst_v2"
+
+
+@pytest.mark.parametrize(
+    "alias, canonical", [("STDDEV", "STDDEV_SAMP"), ("VAR", "VAR_SAMP")]
+)
+def test_same_sunburst_metric_accepts_aggregate_aliases(
+    alias: str, canonical: str
+) -> None:
+    """Typed validation and mapped query roles agree on aggregate aliases."""
+    config = _config(
+        metric={"name": "sales", "aggregate": alias, "label": "Sales"},
+        secondary_metric={"name": "sales", "aggregate": canonical, "label": "Sales"},
+    )
+    form_data = map_config_to_form_data(config)
+    roles, error = validate_sunburst_result_data(
+        [{"region": "A", "country": "B", "Sales": 1}], form_data
+    )
+    assert error is None
+    assert roles is not None
+    assert roles.secondary_metric is None
+
+
+@pytest.mark.parametrize("null_role", ["Sales", "Profit"])
+def test_null_sunburst_metrics_normalize_without_changing_null_hierarchy(
+    null_role: str,
+) -> None:
+    """Only missing metric cells become zero; hierarchy and other metrics survive."""
+    form_data = map_config_to_form_data(
+        _config(
+            secondary_metric={"name": "profit", "aggregate": "SUM", "label": "Profit"}
+        )
+    )
+    row = {"region": None, "country": "B", "Sales": 4, "Profit": 2}
+    row[null_role] = None
+    result = chart_data_command_result(
+        [row],
+        coltypes=[
+            GenericDataType.STRING,
+            GenericDataType.STRING,
+            GenericDataType.NUMERIC,
+            GenericDataType.NUMERIC,
+        ],
+    )
+    data, error = first_query_data(result)
+    assert error is None
+    assert data is not None
+    _, error = validate_sunburst_result_data(data, form_data)
+    assert error is None
+    assert data == [{**row, null_role: 0}]

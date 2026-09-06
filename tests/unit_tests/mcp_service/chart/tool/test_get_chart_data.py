@@ -589,13 +589,17 @@ class _AsyncContext:
     [("unsaved", "json"), ("saved", "json"), ("cached-update", "csv")],
     ids=["unsaved-json", "saved-json", "cached-update-csv"],
 )
-async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
+@pytest.mark.parametrize("missing_metrics", [False, True])
+@pytest.mark.parametrize("cache_timeout", [-1, 0, 300])
+async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(  # noqa: C901
     app: Any,
     mcp_server: Any,
     mock_auth: Any,
     monkeypatch: pytest.MonkeyPatch,
     path: str,
     response_format: str,
+    missing_metrics: bool,
+    cache_timeout: int,
 ) -> None:
     """Actual saved and unsaved entries preserve Decimal until serialization."""
     from fastmcp import Client
@@ -629,7 +633,7 @@ async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
                         ),
                         "Sales": pd.Series(
                             [
-                                Decimal("12.50"),
+                                None if missing_metrics else Decimal("12.50"),
                                 Decimal("12.500"),
                                 Decimal("13.00"),
                             ],
@@ -637,7 +641,9 @@ async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
                         ),
                         "Profit": pd.Series(
                             [
-                                Decimal("0.10000000000000000001"),
+                                None
+                                if missing_metrics
+                                else Decimal("0.10000000000000000001"),
                                 Decimal("0.100000000000000000010"),
                                 Decimal("0.2"),
                             ],
@@ -650,6 +656,7 @@ async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
             return chart_data_command_result(
                 rows,
                 columns=["region", "country", "Sales", "Profit"],
+                cache_timeout=cache_timeout,
                 coltypes=[
                     GenericDataType.STRING,
                     GenericDataType.STRING,
@@ -676,7 +683,7 @@ async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
     monkeypatch.setattr(module, "set_query_context_form_data", lambda *_args: None)
     monkeypatch.setattr(module.guest_scope, "is_guest_read", lambda: False)
 
-    validated_values: list[tuple[Decimal, Decimal]] = []
+    validated_values: list[tuple[Decimal | None, Decimal | None]] = []
     original_validator = module.validate_sunburst_result_data
 
     def validate_result(
@@ -747,6 +754,15 @@ async def test_decimal_sunburst_get_data_is_numeric_and_json_safe(
     wire_response = tool_result.structured_content.get(
         "result", tool_result.structured_content
     )
+    assert wire_response.get("error_type") is None
+    if missing_metrics:
+        if response_format == "csv":
+            assert "Brazil,0,0" in wire_response["csv_data"]
+        else:
+            assert wire_response["data"][0]["Sales"] == 0
+            assert wire_response["data"][0]["Profit"] == 0
+        assert validated_values == [(None, None)]
+        return
     if response_format == "csv":
         assert "12.50,0.10000000000000000001" in wire_response["csv_data"]
     else:
@@ -1230,7 +1246,7 @@ def test_chart_data_column_identity_distinguishes_booleans_and_integers() -> Non
             "coltypes": [0, 0],
         },
         {"data": [], "cached_dttm": {}},
-        {"data": [], "cache_timeout": -1},
+        {"data": [], "cache_timeout": -2},
         {"data": [], "rowcount": {}},
         {"data": [], "is_cached": {}},
         {"data": [], "metadata": HostileResultEnum.VALUE},
@@ -1318,7 +1334,7 @@ async def test_unsaved_get_data_rejects_invalid_result_before_consumers(
             "coltypes": [0, 0],
         },
         {"data": [], "cached_dttm": {}},
-        {"data": [], "cache_timeout": -1},
+        {"data": [], "cache_timeout": -2},
         {"data": [], "rowcount": {}},
         {"data": [], "is_cached": {}},
         {"data": [], "status": HostileResultEnum.VALUE},

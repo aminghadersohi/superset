@@ -327,3 +327,16 @@ class TestFormatDataColumns:
         assert column.sample_values == []
         assert column.unique_count == 0
         assert column.statistics == {"sampled_rows": 0}
+
+
+@pytest.mark.parametrize("value", [Decimal("1e4096"), Decimal("1e-4096")])
+def test_bounded_extreme_decimals_preserve_other_columns(value: Decimal) -> None:
+    """Both signs of bounded exponents retain complete metadata sampling."""
+    columns = format_data_columns(
+        [{"value": value, "group": "A"}, {"value": value, "group": "B"}],
+        ["value", "group"],
+    )
+    assert columns[0].unique_count == 1
+    assert columns[1].unique_count == 2
+    assert columns[0].sample_values == [value, value]
+    assert columns[1].sample_values == ["A", "B"]

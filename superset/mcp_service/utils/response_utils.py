@@ -253,7 +253,9 @@ def _decimal_profile_identity(
         int.bit_length(numerator) > _MAX_PROFILE_INTEGER_BITS
         or int.bit_length(denominator) > _MAX_PROFILE_INTEGER_BITS
     ):
-        return None
+        # Digit/exponent caps above already bound these exact integers. Keep
+        # fractional extremes in the sample just like oversized integers.
+        return ("oversized_fraction", numerator, denominator)
     return ("number", numerator, denominator)
 
 

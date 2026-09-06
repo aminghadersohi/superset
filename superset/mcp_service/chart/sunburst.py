@@ -155,11 +155,11 @@ def resolve_sunburst_result_roles(
                 error="Sunburst secondary metric is malformed.",
                 error_type="InvalidSunburstFormData",
             )
+        primary_identity = _metric_query_identity(primary_metric)
         if (
             secondary.casefold() == primary.casefold()
-            and _metric_query_identity(primary_metric)
-            == _metric_query_identity(secondary_metric)
-            and _metric_query_identity(primary_metric) is not None
+            and primary_identity == _metric_query_identity(secondary_metric)
+            and primary_identity is not None
         ):
             # The frontend interprets a repeated primary metric as categorical
             # color mode and the query has one physical metric output.
@@ -198,10 +198,10 @@ def _valid_hierarchy_value(value: Any) -> bool:
     return not isinstance(value, (Mapping, list, tuple, set))
 
 
-def validate_sunburst_result_data(
+def validate_sunburst_result_data(  # noqa: C901
     data: Any, form_data: Mapping[str, Any]
 ) -> tuple[SunburstResultRoles | None, ChartError | None]:
-    """Validate every Sunburst row and all resolved result aliases."""
+    """Validate result aliases and normalize SQL NULL metrics to frontend zero."""
     roles, error = resolve_sunburst_result_roles(form_data)
     if error is not None:
         return None, error
@@ -246,6 +246,11 @@ def validate_sunburst_result_data(
             *([roles.secondary_metric] if roles.secondary_metric else []),
         ):
             assert field is not None
+            # The frontend treeBuilder assigns zero to missing metric values.
+            # Generic envelope validation has already copied producer rows into
+            # exact dictionaries and normalized database missing-value scalars.
+            if row[field] is None and type(row) is dict:
+                row[field] = 0
             if not _finite_number(row[field]):
                 return None, ChartError(
                     error=(

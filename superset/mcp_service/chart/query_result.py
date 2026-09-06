@@ -37,6 +37,7 @@ from pydantic_core import to_json
 
 from superset.common.chart_data import ChartDataResultFormat
 from superset.common.db_query_status import QueryStatus
+from superset.constants import CACHE_DISABLED_TIMEOUT
 from superset.mcp_service.chart.schemas import ChartError
 from superset.utils.core import (
     ExtraFiltersReasonType,
@@ -1143,7 +1144,11 @@ def _metadata_shape_error(  # noqa: C901
     if "cache_timeout" in payload:
         timeout = dict.__getitem__(payload, "cache_timeout")
         if timeout is not None and not (
-            type(timeout) is int and 0 <= timeout <= MAX_QUERY_RESULT_CACHE_TIMEOUT
+            type(timeout) is int
+            and (
+                timeout == CACHE_DISABLED_TIMEOUT
+                or 0 <= timeout <= MAX_QUERY_RESULT_CACHE_TIMEOUT
+            )
         ):
             return _invalid_metadata(label)
     if "cache_key" in payload:

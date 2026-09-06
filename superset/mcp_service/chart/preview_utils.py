@@ -213,6 +213,7 @@ def _generate_ascii_preview_from_data(
     else:
         content = _generate_safe_ascii_table(data)
 
+    content = "\n".join(line[:width] for line in content.splitlines()[:height])
     return ASCIIPreview(
         ascii_content=content, width=width, height=height, supports_color=False
     )

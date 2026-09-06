@@ -88,7 +88,7 @@ class GaugeChartPlugin(BaseChartPlugin):
         return "gauge_chart"
 
     def normalize_column_refs(self, config: Any, dataset_context: Any) -> Any:
-        config_dict = config.model_dump()
+        config_dict = config.model_dump(exclude_unset=True)
 
         if config_dict.get("metric"):
             if config_dict["metric"].get("sql_expression"):

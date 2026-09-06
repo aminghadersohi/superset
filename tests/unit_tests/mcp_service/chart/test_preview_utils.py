@@ -326,3 +326,18 @@ def test_unsaved_preview_rejects_hostile_enum_without_dispatching_hooks():
 
     assert isinstance(result, ChartError)
     assert result.error_type == "InvalidQueryResult"
+
+
+def test_ascii_preview_content_respects_requested_dimensions() -> None:
+    """Reported canvas dimensions also bound the rendered text."""
+    result = preview_utils._generate_ascii_preview_from_data(
+        [{"category": "a long category label", "value": 12}] * 10,
+        {"viz_type": "table"},
+        width=12,
+        height=3,
+    )
+    assert not isinstance(result, ChartError)
+    assert result.width == 12
+    assert result.height == 3
+    assert len(result.ascii_content.splitlines()) == 3
+    assert all(len(line) <= 12 for line in result.ascii_content.splitlines())

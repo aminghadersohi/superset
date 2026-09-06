@@ -99,7 +99,8 @@ async def generate_chart(  # noqa: C901
     - LLM clients MUST display returned chart URL to users
     - Use numeric dataset ID or UUID (NOT schema.table_name format)
     - MUST include chart_type in config (one of: 'xy', 'table', 'pie',
-      'sunburst', 'gauge_chart', 'pivot_table', 'mixed_timeseries', 'handlebars', 'big_number',
+      'sunburst', 'gauge_chart', 'pivot_table', 'mixed_timeseries', 'handlebars',
+      'big_number',
       'histogram', 'box_plot', 'waterfall', plus host-gated types returned by
       get_chart_type_schema such as 'interactive_pivot')
 

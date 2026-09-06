@@ -76,19 +76,19 @@ def chart_data_command_result(
     columns: list[str] | None = None,
     coltypes: list[GenericDataType] | None = None,
     frame: pd.DataFrame | None = None,
+    cache_timeout: int = 300,
 ) -> dict[str, Any]:
     """Materialize a DataFrame and pass it through ``ChartDataCommand.run``."""
     rows = rows if rows is not None else [{"value": 1}]
-    columns = (
-        columns
-        if columns is not None
-        else list(frame.columns)
-        if frame is not None
-        else list(rows[0])
-        if rows
-        else ["value"]
-    )
-    coltypes = coltypes or [GenericDataType.NUMERIC] * len(columns)
+    if columns is None:
+        if frame is not None:
+            columns = list(frame.columns)
+        elif rows:
+            columns = list(rows[0])
+        else:
+            columns = ["value"]
+    if coltypes is None:
+        coltypes = [GenericDataType.NUMERIC] * len(columns)
     frame = frame if frame is not None else pd.DataFrame(rows, columns=columns)
     processor_context = SimpleNamespace(
         datasource=object(), result_format=ChartDataResultFormat.JSON
@@ -100,7 +100,7 @@ def chart_data_command_result(
         "cache_key": None,
         "cached_dttm": None,
         "queried_dttm": None,
-        "cache_timeout": 300,
+        "cache_timeout": cache_timeout,
         "data": data,
         "colnames": columns,
         "coltypes": coltypes,
